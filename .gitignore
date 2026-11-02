@@ -1,0 +1,16 @@
+/target
+tests/tests_output/
+*.pdf
+.DS_Store
+
+# User's local / extra CAD fixtures - remained untouched and uncommitted
+tests/fixtures/local/*
+!tests/fixtures/local/README.md
+!tests/fixtures/local/.gitkeep
+tests/fixtures/extra/
+tests/fixtures/custom/
+tests/fixtures/**/*.local.*
+tests/fixtures/*.local.*
+*.local.dxf
+*.local.dwg
+*.local.dwf
