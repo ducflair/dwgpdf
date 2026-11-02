@@ -43,6 +43,18 @@ struct Cli {
     /// Document author metadata
     #[arg(long)]
     author: Option<String>,
+
+    /// Enable CAD entity and layer lineweights (by default lines are rendered as uniform thin hairlines like Three.js/CAD canvas)
+    #[arg(long, default_value_t = false)]
+    use_lineweights: bool,
+
+    /// Line width scale factor
+    #[arg(long, default_value_t = 1.0)]
+    line_width_scale: f64,
+
+    /// Minimum / uniform line width in points (default: 0.0 for laser-thin hairline like CAD viewer)
+    #[arg(long, default_value_t = 0.0)]
+    min_line_width: f64,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -134,6 +146,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             creator: Some("dwgpdf".to_string()),
             ..Default::default()
         },
+        use_lineweights: cli.use_lineweights,
+        line_width_scale: cli.line_width_scale,
+        min_line_width_pt: cli.min_line_width,
         ..Default::default()
     };
 

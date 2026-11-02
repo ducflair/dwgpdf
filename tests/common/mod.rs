@@ -68,8 +68,7 @@ pub fn ensure_fixtures() {
 
         let local_src_candidates = [
             std::env::var("FIXTURES_DIR").ok().map(PathBuf::from),
-            Some(PathBuf::from("/Users/jorgesoares/Ducflair/fixtures/src")),
-            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("fixtures/src")),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().map(|p| p.join("fixtures/src")),
         ];
 
         let sync_group = |files: &[&str], subfolder: &str, remote_folder: &str| {

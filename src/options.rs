@@ -100,6 +100,7 @@ pub struct ConversionOptions {
     pub color_mode: ColorMode,
     pub margin_pt: f64,
     pub scale: Option<f64>,
+    pub use_lineweights: bool,
     pub line_width_scale: f64,
     pub min_line_width_pt: f64,
     pub background_color: Option<String>,
@@ -118,8 +119,9 @@ impl Default for ConversionOptions {
             color_mode: ColorMode::Normal,
             margin_pt: 20.0, // 20pt margin
             scale: None,
+            use_lineweights: false,
             line_width_scale: 1.0,
-            min_line_width_pt: 0.5,
+            min_line_width_pt: 0.0,
             background_color: Some("#ffffff".to_string()),
             default_draw_color: Some("#000000".to_string()),
             export_layers: true,

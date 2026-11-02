@@ -92,6 +92,26 @@ pub fn clean_mtext(text: &str) -> Vec<String> {
                             }
                         }
                     }
+                    Some('U') | Some('u') => {
+                        if chars.peek() == Some(&'+') {
+                            chars.next(); // consume '+'
+                            let mut hex_str = String::with_capacity(4);
+                            for _ in 0..4 {
+                                if let Some(&next_ch) = chars.peek() {
+                                    if next_ch.is_ascii_hexdigit() {
+                                        hex_str.push(chars.next().unwrap());
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Ok(code) = u32::from_str_radix(&hex_str, 16) {
+                                if let Some(ch) = char::from_u32(code) {
+                                    current_line.push(ch);
+                                }
+                            }
+                        }
+                    }
                     Some(other) => {
                         // Unknown escape, skip
                         if other == ';' {

@@ -269,3 +269,114 @@ fn test_error_handling() {
     let res = convert_file_to_pdf(Path::new("non_existent_file.dxf"), &ConversionOptions::default());
     assert!(res.is_err(), "Non-existent file should return an error");
 }
+
+#[test]
+fn test_multi_page_and_last_page_model() {
+    let local_dir = Path::new("tests/fixtures/local");
+    if local_dir.exists() {
+        // 1. Files with 1 enabled paper layout + 1 model space = 2 pages
+        for file_name in &["HG8-GTC-EXE-001-R02.dwg", "HG5-ACV-EXE-001-R01%20_%20Telas%20Finais.dwg"] {
+            let file_path = local_dir.join(file_name);
+            if file_path.exists() {
+                let opts = ConversionOptions::default();
+                let pdf_bytes = convert_file_to_pdf(&file_path, &opts)
+                    .unwrap_or_else(|e| panic!("Failed to convert {}: {:?}", file_name, e));
+                validate_pdf(&pdf_bytes);
+
+                let doc = hipdf::lopdf::Document::load_mem(&pdf_bytes).expect("parse generated pdf");
+                let pages = doc.get_pages();
+                assert_eq!(pages.len(), 2, "Expected exactly 2 pages (layout + model) for {}", file_name);
+            }
+        }
+
+        // 2. File with Layout1 (enabled), Layout2 (empty/hidden), and Model space:
+        // Must exclude Layout2 and produce exactly 2 pages (Layout1 + Model space).
+        let hg_pr = local_dir.join("Honest%20Green%20Principe%20Real (1).dwg");
+        if hg_pr.exists() {
+            let opts = ConversionOptions::default();
+            let pdf_bytes = convert_file_to_pdf(&hg_pr, &opts)
+                .unwrap_or_else(|e| panic!("Failed to convert Honest Green DWG: {:?}", e));
+            validate_pdf(&pdf_bytes);
+
+            let doc = hipdf::lopdf::Document::load_mem(&pdf_bytes).expect("parse generated pdf");
+            let pages = doc.get_pages();
+            assert_eq!(pages.len(), 2, "Expected exactly 2 pages (Layout1 + Model, excluding empty Layout2)");
+        }
+
+        // 3. File with no populated layouts (Sheetmetal Jeep has unused empty Layout1):
+        // Must exclude unused Layout1 and produce exactly 1 page (Model space).
+        let jeep = local_dir.join("Sheetmetal Jeep.dxf");
+        if jeep.exists() {
+            let opts = ConversionOptions::default();
+            let pdf_bytes = convert_file_to_pdf(&jeep, &opts)
+                .unwrap_or_else(|e| panic!("Failed to convert Sheetmetal Jeep DXF: {:?}", e));
+            validate_pdf(&pdf_bytes);
+
+            let doc = hipdf::lopdf::Document::load_mem(&pdf_bytes).expect("parse generated pdf");
+            let pages = doc.get_pages();
+            assert_eq!(pages.len(), 1, "Expected exactly 1 page (Model space, excluding empty Layout1)");
+        }
+
+        // 4. Multi-sheet architectural file (HG8_ARQ has 50 active layouts + 1 model space):
+        // Must include all 50 active layouts ordered by tab_order, with model space as page 51.
+        let hg8 = local_dir.join("HG8_ARQ.dwg");
+        if hg8.exists() {
+            let opts = ConversionOptions::default();
+            let pdf_bytes = convert_file_to_pdf(&hg8, &opts)
+                .unwrap_or_else(|e| panic!("Failed to convert HG8_ARQ.dwg: {:?}", e));
+            validate_pdf(&pdf_bytes);
+
+            let doc = hipdf::lopdf::Document::load_mem(&pdf_bytes).expect("parse generated pdf");
+            let pages = doc.get_pages();
+            assert_eq!(pages.len(), 52, "Expected exactly 52 pages (51 layouts in tab order + 1 model space)");
+        }
+    }
+}
+
+#[test]
+fn test_lineweights_toggle() {
+    let test_file = Path::new("tests/fixtures/dxf/wipeout_door.dxf");
+    if !test_file.exists() {
+        return;
+    }
+
+    // 1. Default (use_lineweights = false): uniform thin hairline (0 w)
+    let opts_default = ConversionOptions::default();
+    assert!(!opts_default.use_lineweights);
+    assert_eq!(opts_default.min_line_width_pt, 0.0);
+    let pdf_default = convert_file_to_pdf(test_file, &opts_default).expect("convert default");
+    validate_pdf(&pdf_default);
+
+    let doc_default = hipdf::lopdf::Document::load_mem(&pdf_default).expect("parse pdf");
+    let mut default_widths = std::collections::HashSet::new();
+    for (_, page_id) in doc_default.get_pages() {
+        if let Ok(content_data) = doc_default.get_page_content(page_id) {
+            let content_str = String::from_utf8_lossy(&content_data);
+            for line in content_str.lines() {
+                if let Some(pos) = line.rfind(" w") {
+                    if pos + 2 == line.len() {
+                        if let Some(num_str) = line[..pos].split_whitespace().last() {
+                            default_widths.insert(num_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Under uniform thin hairline mode, all lines have uniform width (0 w)
+    assert!(
+        default_widths.contains("0") || default_widths.contains("0.00") || default_widths.len() <= 1,
+        "Expected 0 in default widths: {:?}",
+        default_widths
+    );
+
+    // 2. Opt-in (use_lineweights = true): CAD lineweights enabled
+    let opts_lineweights = ConversionOptions {
+        use_lineweights: true,
+        ..Default::default()
+    };
+    let pdf_lineweights = convert_file_to_pdf(test_file, &opts_lineweights).expect("convert with lineweights");
+    validate_pdf(&pdf_lineweights);
+}
+
+

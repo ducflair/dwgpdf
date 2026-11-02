@@ -17,17 +17,17 @@ impl Point2D {
 pub fn generate_circle_path(cx: f64, cy: f64, radius: f64) -> String {
     let r = radius.abs();
     if r < 1e-6 {
-        return format!("{:.4} {:.4} m\n", cx, cy);
+        return format!("{:.2} {:.2} m\n", cx, cy);
     }
     // kappa = 4 * (sqrt(2) - 1) / 3
     let k = 0.5522847498307936 * r;
 
     format!(
-        "{:.4} {:.4} m\n\
-         {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} c\n\
-         {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} c\n\
-         {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} c\n\
-         {:.4} {:.4} {:.4} {:.4} {:.4} {:.4} c\n\
+        "{:.2} {:.2} m\n\
+         {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c\n\
+         {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c\n\
+         {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c\n\
+         {:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c\n\
          h\n",
         cx + r, cy,
         cx + r, cy + k, cx + k, cy + r, cx, cy + r,
@@ -42,7 +42,7 @@ pub fn generate_circle_path(cx: f64, cy: f64, radius: f64) -> String {
 pub fn generate_arc_path(cx: f64, cy: f64, radius: f64, start_angle: f64, end_angle: f64) -> String {
     let r = radius.abs();
     if r < 1e-6 {
-        return format!("{:.4} {:.4} m\n", cx, cy);
+        return format!("{:.2} {:.2} m\n", cx, cy);
     }
 
     let mut start = start_angle;
@@ -68,7 +68,7 @@ pub fn generate_arc_path(cx: f64, cy: f64, radius: f64, start_angle: f64, end_an
     let mut out = String::new();
     let p0_x = cx + r * start.cos();
     let p0_y = cy + r * start.sin();
-    out.push_str(&format!("{:.4} {:.4} m\n", p0_x, p0_y));
+    out.push_str(&format!("{:.2} {:.2} m\n", p0_x, p0_y));
 
     for i in 0..num_segments {
         let a1 = start + (i as f64) * step;
@@ -90,7 +90,7 @@ pub fn generate_arc_path(cx: f64, cy: f64, radius: f64, start_angle: f64, end_an
         let ep_y = cy + r * sin2;
 
         out.push_str(&format!(
-            "{:.4} {:.4} {:.4} {:.4} {:.4} {:.4} c\n",
+            "{:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c\n",
             cp1_x, cp1_y, cp2_x, cp2_y, ep_x, ep_y
         ));
     }
@@ -102,7 +102,7 @@ pub fn generate_arc_path(cx: f64, cy: f64, radius: f64, start_angle: f64, end_an
 /// In DXF: bulge = tan(included_angle / 4).
 pub fn generate_bulge_segment(p1: Point2D, p2: Point2D, bulge: f64) -> String {
     if bulge.abs() < 1e-6 {
-        return format!("{:.4} {:.4} l\n", p2.x, p2.y);
+        return format!("{:.2} {:.2} l\n", p2.x, p2.y);
     }
 
     let dx = p2.x - p1.x;
@@ -160,7 +160,7 @@ pub fn generate_bulge_segment(p1: Point2D, p2: Point2D, bulge: f64) -> String {
         let ep_y = cy + r * sin2;
 
         out.push_str(&format!(
-            "{:.4} {:.4} {:.4} {:.4} {:.4} {:.4} c\n",
+            "{:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c\n",
             cp1_x, cp1_y, cp2_x, cp2_y, ep_x, ep_y
         ));
     }
@@ -204,7 +204,7 @@ pub fn generate_ellipse_path(
     let deriv = |t: f64| (-mx * t.sin() + nx * t.cos(), -my * t.sin() + ny * t.cos());
 
     let (p0_x, p0_y) = pt(start);
-    out.push_str(&format!("{:.4} {:.4} m\n", p0_x, p0_y));
+    out.push_str(&format!("{:.2} {:.2} m\n", p0_x, p0_y));
 
     for i in 0..num_segments {
         let t1 = start + (i as f64) * step;
@@ -224,7 +224,7 @@ pub fn generate_ellipse_path(
         let cp2_y = p2y - k * d2y;
 
         out.push_str(&format!(
-            "{:.4} {:.4} {:.4} {:.4} {:.4} {:.4} c\n",
+            "{:.2} {:.2} {:.2} {:.2} {:.2} {:.2} c\n",
             cp1_x, cp1_y, cp2_x, cp2_y, p2x, p2y
         ));
     }
