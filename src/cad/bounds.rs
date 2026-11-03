@@ -119,10 +119,9 @@ impl Transform2D {
         }
     }
 
-    pub fn from_trs(tx: f64, ty: f64, rotation_deg: f64, sx: f64, sy: f64) -> Self {
-        let rad = rotation_deg.to_radians();
-        let cos = rad.cos();
-        let sin = rad.sin();
+    pub fn from_trs(tx: f64, ty: f64, rotation_rad: f64, sx: f64, sy: f64) -> Self {
+        let cos = rotation_rad.cos();
+        let sin = rotation_rad.sin();
         Self {
             a: sx * cos,
             b: sx * sin,

@@ -1,6 +1,6 @@
 use crate::cad::bounds::{calculate_block_bounds, calculate_document_bounds, entity_intersects_bbox, BoundingBox, Transform2D};
 use crate::cad::color::{parse_hex_color, resolve_color, rgb_to_pdf};
-use crate::cad::mtext::{clean_mtext, decode_cad_text_escapes};
+use crate::cad::mtext::{decode_cad_text_escapes, estimate_str_width, parse_mtext_details, MTextAlignment};
 use crate::error::{ConversionError, ConversionResult};
 use crate::options::{ColorMode, ConversionMode, ConversionOptions, Orientation, PageSize};
 use crate::pdf::geometry::{
@@ -35,6 +35,12 @@ pub struct CadToPdfBuilder<'a> {
     font_manager: FontManager,
     primary_font_id: (u32, u16),
     primary_font_name: String,
+    bold_font_id: (u32, u16),
+    bold_font_name: String,
+    oblique_font_id: (u32, u16),
+    oblique_font_name: String,
+    bold_oblique_font_id: (u32, u16),
+    bold_oblique_font_name: String,
     layer_colors: HashMap<String, Color>,
     default_draw_rgb: (u8, u8, u8),
     block_bounds_cache: HashMap<String, BoundingBox>,
@@ -63,16 +69,33 @@ impl<'a> CadToPdfBuilder<'a> {
             .embed_font(&mut pdf_doc, helvetica)
             .map_err(|e| ConversionError::PdfGeneration(format!("Font embedding error: {}", e)))?;
 
+        let helvetica_bold = Font::standard(StandardFont::HelveticaBold);
+        let (bold_font_id, bold_font_name) = font_manager
+            .embed_font(&mut pdf_doc, helvetica_bold)
+            .map_err(|e| ConversionError::PdfGeneration(format!("Font embedding error: {}", e)))?;
+
+        let helvetica_oblique = Font::standard(StandardFont::HelveticaOblique);
+        let (oblique_font_id, oblique_font_name) = font_manager
+            .embed_font(&mut pdf_doc, helvetica_oblique)
+            .map_err(|e| ConversionError::PdfGeneration(format!("Font embedding error: {}", e)))?;
+
+        let helvetica_bold_oblique = Font::standard(StandardFont::HelveticaBoldOblique);
+        let (bold_oblique_font_id, bold_oblique_font_name) = font_manager
+            .embed_font(&mut pdf_doc, helvetica_bold_oblique)
+            .map_err(|e| ConversionError::PdfGeneration(format!("Font embedding error: {}", e)))?;
+
         let mut ocg_manager = OCGManager::new();
         let mut layer_ocg_map = HashMap::new();
 
         if options.export_layers {
             for layer in doc.layers.iter() {
-                if !layer.is_frozen() && !layer.is_off() && layer.is_plottable {
-                    let idx = ocg_manager.add_layer(hipdf::ocg::Layer::new(&layer.name, true));
-                    let tag = format!("L{}", idx);
-                    layer_ocg_map.insert(layer.name.clone(), tag);
+                if layer.name.eq_ignore_ascii_case("defpoints") || layer.name.to_lowercase().contains("nplt") || !layer.is_plottable {
+                    continue;
                 }
+                let is_visible = !layer.is_frozen() && !layer.is_off();
+                let idx = ocg_manager.add_layer(hipdf::ocg::Layer::new(&layer.name, is_visible));
+                let tag = format!("L{}", idx);
+                layer_ocg_map.insert(layer.name.clone(), tag);
             }
             if !layer_ocg_map.is_empty() {
                 ocg_manager.initialize(&mut pdf_doc);
@@ -89,10 +112,48 @@ impl<'a> CadToPdfBuilder<'a> {
             font_manager,
             primary_font_id,
             primary_font_name,
+            bold_font_id,
+            bold_font_name,
+            oblique_font_id,
+            oblique_font_name,
+            bold_oblique_font_id,
+            bold_oblique_font_name,
             layer_colors,
             default_draw_rgb,
             block_bounds_cache: HashMap::new(),
         })
+    }
+
+    fn select_font_name(&self, is_bold: bool, is_italic: bool) -> &str {
+        match (is_bold, is_italic) {
+            (true, true) => &self.bold_oblique_font_name,
+            (true, false) => &self.bold_font_name,
+            (false, true) => &self.oblique_font_name,
+            (false, false) => &self.primary_font_name,
+        }
+    }
+
+    fn resolve_mtext_value<'b>(&'b self, mtext: &'b acadrust::entities::MText) -> std::borrow::Cow<'b, str> {
+        if let Some(xdict_handle) = mtext.common.xdictionary_handle {
+            if let Some(ObjectType::Dictionary(dict)) = self.doc.objects.get(&xdict_handle) {
+                if let Some((_, xrec_handle)) = dict.entries.iter().find(|(k, _)| k.eq_ignore_ascii_case("ACAD_MTEXT_2008_RT")) {
+                    if let Some(ObjectType::XRecord(xrec)) = self.doc.objects.get(xrec_handle) {
+                        let mut full_text = String::new();
+                        for entry in &xrec.entries {
+                            if entry.code == 3 || entry.code == 1 {
+                                if let Some(s) = entry.value.as_string() {
+                                    full_text.push_str(s);
+                                }
+                            }
+                        }
+                        if !full_text.is_empty() {
+                            return std::borrow::Cow::Owned(full_text);
+                        }
+                    }
+                }
+            }
+        }
+        std::borrow::Cow::Borrowed(&mtext.value)
     }
 
     pub fn bbox(&self) -> &BoundingBox {
@@ -497,17 +558,26 @@ impl<'a> CadToPdfBuilder<'a> {
             let clip_y = vp_cy - vp_h / 2.0;
 
             let vp_scale = vp_h / vp.view_height;
-            let twist_rad = -(vp.twist_angle).to_radians();
+            let twist_rad = -vp.twist_angle;
             let cos_tw = twist_rad.cos();
             let sin_tw = twist_rad.sin();
 
+            // In AutoCAD DCS, the view center is relative to view_target in WCS
+            let model_cx = vp.view_target.x + vp.view_center.x * cos_tw - vp.view_center.y * sin_tw;
+            let model_cy = vp.view_target.y + vp.view_center.x * sin_tw + vp.view_center.y * cos_tw;
+
+            let a = cos_tw * vp_scale;
+            let b = sin_tw * vp_scale;
+            let c = -sin_tw * vp_scale;
+            let d = cos_tw * vp_scale;
+
             let vp_transform = Transform2D {
-                a: cos_tw * vp_scale,
-                b: sin_tw * vp_scale,
-                c: -sin_tw * vp_scale,
-                d: cos_tw * vp_scale,
-                tx: vp_cx - (vp.view_center.x * cos_tw * vp_scale - vp.view_center.y * sin_tw * vp_scale),
-                ty: vp_cy - (vp.view_center.x * sin_tw * vp_scale + vp.view_center.y * cos_tw * vp_scale),
+                a,
+                b,
+                c,
+                d,
+                tx: vp_cx - (a * model_cx + c * model_cy),
+                ty: vp_cy - (b * model_cx + d * model_cy),
             };
 
             let frozen_handles: HashSet<_> = vp.frozen_layers.iter().copied().collect();
@@ -523,10 +593,10 @@ impl<'a> CadToPdfBuilder<'a> {
             let mx = (extent_x * 0.15).max(10.0);
             let my = (extent_y * 0.15).max(10.0);
             let vp_model_box = BoundingBox {
-                min_x: vp.view_center.x - extent_x - mx,
-                min_y: vp.view_center.y - extent_y - my,
-                max_x: vp.view_center.x + extent_x + mx,
-                max_y: vp.view_center.y + extent_y + my,
+                min_x: model_cx - extent_x - mx,
+                min_y: model_cy - extent_y - my,
+                max_x: model_cx + extent_x + mx,
+                max_y: model_cy + extent_y + my,
             };
 
             // Push clipping boundary
@@ -542,7 +612,10 @@ impl<'a> CadToPdfBuilder<'a> {
                     continue;
                 }
                 if let Some(layer) = self.doc.layers.iter().find(|l| l.name == *layer_name) {
-                    if !layer.is_plottable || layer.is_frozen() || layer.is_off() || frozen_handles.contains(&layer.handle) {
+                    if !layer.is_plottable || frozen_handles.contains(&layer.handle) {
+                        continue;
+                    }
+                    if !self.options.export_layers && (layer.is_frozen() || layer.is_off()) {
                         continue;
                     }
                 }
@@ -605,7 +678,10 @@ impl<'a> CadToPdfBuilder<'a> {
                 continue;
             }
             if let Some(layer) = self.doc.layers.iter().find(|l| l.name == layer_name) {
-                if !layer.is_plottable || layer.is_frozen() || layer.is_off() {
+                if !layer.is_plottable {
+                    continue;
+                }
+                if !self.options.export_layers && (layer.is_frozen() || layer.is_off()) {
                     continue;
                 }
             }
@@ -649,6 +725,9 @@ impl<'a> CadToPdfBuilder<'a> {
 
         let mut resources = Dictionary::new();
         self.font_manager.add_to_resources(&mut resources, self.primary_font_id, &self.primary_font_name);
+        self.font_manager.add_to_resources(&mut resources, self.bold_font_id, &self.bold_font_name);
+        self.font_manager.add_to_resources(&mut resources, self.oblique_font_id, &self.oblique_font_name);
+        self.font_manager.add_to_resources(&mut resources, self.bold_oblique_font_id, &self.bold_oblique_font_name);
 
         if self.options.export_layers && !self.layer_ocg_map.is_empty() {
             self.ocg_manager.setup_page_resources(&mut resources);
@@ -732,7 +811,10 @@ impl<'a> CadToPdfBuilder<'a> {
                 continue;
             }
             if let Some(layer) = self.doc.layers.iter().find(|l| l.name == layer_name) {
-                if !layer.is_plottable || layer.is_frozen() || layer.is_off() {
+                if !layer.is_plottable {
+                    continue;
+                }
+                if !self.options.export_layers && (layer.is_frozen() || layer.is_off()) {
                     continue;
                 }
             }
@@ -776,6 +858,9 @@ impl<'a> CadToPdfBuilder<'a> {
 
         let mut resources = Dictionary::new();
         self.font_manager.add_to_resources(&mut resources, self.primary_font_id, &self.primary_font_name);
+        self.font_manager.add_to_resources(&mut resources, self.bold_font_id, &self.bold_font_name);
+        self.font_manager.add_to_resources(&mut resources, self.oblique_font_id, &self.oblique_font_name);
+        self.font_manager.add_to_resources(&mut resources, self.bold_oblique_font_id, &self.bold_oblique_font_name);
 
         if self.options.export_layers && !self.layer_ocg_map.is_empty() {
             self.ocg_manager.setup_page_resources(&mut resources);
@@ -856,7 +941,10 @@ impl<'a> CadToPdfBuilder<'a> {
         }
 
         if let Some(layer) = self.doc.layers.iter().find(|l| l.name == layer_name) {
-            if !layer.is_plottable || layer.is_frozen() || layer.is_off() {
+            if !layer.is_plottable {
+                return;
+            }
+            if !self.options.export_layers && (layer.is_frozen() || layer.is_off()) {
                 return;
             }
         }
@@ -902,8 +990,8 @@ impl<'a> CadToPdfBuilder<'a> {
                 let (cx, cy) = transform.apply(arc.center.x, arc.center.y);
                 let r_rad = arc.radius * transform.scale();
                 let rot = transform.rotation_radians();
-                let start_rad = arc.start_angle.to_radians() + rot;
-                let end_rad = arc.end_angle.to_radians() + rot;
+                let start_rad = arc.start_angle + rot;
+                let end_rad = arc.end_angle + rot;
                 stream.push_str(&generate_arc_path(cx, cy, r_rad, start_rad, end_rad));
                 stream.push_str("S\n");
             }
@@ -1045,25 +1133,53 @@ impl<'a> CadToPdfBuilder<'a> {
             }
             EntityType::Text(txt) => {
                 Self::ensure_fill(stream, state, r, g, b);
-                let (px, py) = transform.apply(
-                    txt.insertion_point.x,
-                    txt.insertion_point.y,
+                let use_align_pt = txt.alignment_point.is_some() && (
+                    txt.horizontal_alignment as u8 != 0 || txt.vertical_alignment as u8 != 0
                 );
+                let pt = if use_align_pt {
+                    txt.alignment_point.as_ref().unwrap()
+                } else {
+                    &txt.insertion_point
+                };
+                let (px, py) = transform.apply(pt.x, pt.y);
                 let font_size = (txt.height * transform.scale()).max(0.05);
+
+                let is_bold = txt.style.to_lowercase().contains("bold") || self.doc.text_styles.iter().any(|s| {
+                    s.name.eq_ignore_ascii_case(&txt.style) && (s.name.to_lowercase().contains("bold") || s.font_file.to_lowercase().contains("bold"))
+                });
+                let is_italic = txt.style.to_lowercase().contains("italic") || txt.style.to_lowercase().contains("oblique") || txt.oblique_angle.abs() > 0.05;
+                let font_name = self.select_font_name(is_bold, is_italic);
 
                 let decoded = decode_cad_text_escapes(&txt.value);
                 let escaped = encode_pdf_string(&decoded);
 
-                let total_rot = txt.rotation.to_radians() + transform.rotation_radians();
+                let total_rot = txt.rotation + transform.rotation_radians();
                 let cos = total_rot.cos();
                 let sin = total_rot.sin();
 
-                stream.push_str(&format!(
-                    "BT\n/{} {:.2} Tf\n{:.4} {:.4} {:.4} {:.4} {:.2} {:.2} Tm\n({}) Tj\nET\n",
-                    self.primary_font_name, font_size,
-                    cos, sin, -sin, cos, px, py,
-                    escaped
-                ));
+                let wf = if txt.width_factor > 0.01 && (txt.width_factor - 1.0).abs() > 0.01 {
+                    txt.width_factor
+                } else {
+                    1.0
+                };
+
+                if (wf - 1.0).abs() > 0.01 {
+                    let tz = (wf * 100.0).clamp(10.0, 500.0);
+                    stream.push_str(&format!(
+                        "BT\n/{} {:.2} Tf\n{:.1} Tz\n{:.4} {:.4} {:.4} {:.4} {:.2} {:.2} Tm\n({}) Tj\n100 Tz\nET\n",
+                        font_name, font_size,
+                        tz,
+                        cos, sin, -sin, cos, px, py,
+                        escaped
+                    ));
+                } else {
+                    stream.push_str(&format!(
+                        "BT\n/{} {:.2} Tf\n{:.4} {:.4} {:.4} {:.4} {:.2} {:.2} Tm\n({}) Tj\nET\n",
+                        font_name, font_size,
+                        cos, sin, -sin, cos, px, py,
+                        escaped
+                    ));
+                }
             }
             EntityType::MText(mtext) => {
                 Self::ensure_fill(stream, state, r, g, b);
@@ -1071,37 +1187,185 @@ impl<'a> CadToPdfBuilder<'a> {
                     mtext.insertion_point.x,
                     mtext.insertion_point.y,
                 );
-                let font_size = (mtext.height * transform.scale()).max(0.05);
+                let base_font_size = (mtext.height * transform.scale()).max(0.05);
 
-                let lines = clean_mtext(&mtext.value);
-                let total_rot = mtext.rotation.to_radians() + transform.rotation_radians();
+                let mtext_val = self.resolve_mtext_value(mtext);
+                let mut details = parse_mtext_details(&mtext_val, mtext.rectangle_width, mtext.height);
+
+                let style_is_bold = mtext.style.to_lowercase().contains("bold") || self.doc.text_styles.iter().any(|s| {
+                    s.name.eq_ignore_ascii_case(&mtext.style) && (s.name.to_lowercase().contains("bold") || s.font_file.to_lowercase().contains("bold"))
+                });
+                let style_is_italic = mtext.style.to_lowercase().contains("italic") || mtext.style.to_lowercase().contains("oblique") || self.doc.text_styles.iter().any(|s| {
+                    s.name.eq_ignore_ascii_case(&mtext.style) && (s.name.to_lowercase().contains("italic") || s.font_file.to_lowercase().contains("italic"))
+                });
+                if style_is_bold {
+                    for line in &mut details.lines {
+                        if !line.is_bold && !mtext_val.contains("|b0") && !mtext_val.contains("|B0") {
+                            line.is_bold = true;
+                        }
+                    }
+                }
+                if style_is_italic {
+                    for line in &mut details.lines {
+                        if !line.is_italic && !mtext_val.contains("|i0") && !mtext_val.contains("|I0") {
+                            line.is_italic = true;
+                        }
+                    }
+                }
+
+                let total_rot = mtext.rotation + transform.rotation_radians();
                 let cos = total_rot.cos();
                 let sin = total_rot.sin();
 
-                for (idx, line) in lines.iter().enumerate() {
-                    let escaped = encode_pdf_string(line);
-                    let line_offset = (idx as f64) * font_size * 1.3 + font_size * 0.8;
-                    let line_px = px + sin * line_offset;
-                    let line_py = py - cos * line_offset;
+                let attach_val = mtext.attachment_point as u8;
+                let is_center_h = attach_val == 2 || attach_val == 5 || attach_val == 8;
+                let is_right_h = attach_val == 3 || attach_val == 6 || attach_val == 9;
+
+                let num_lines = details.lines.len().max(1);
+                let line_font_sizes: Vec<f64> = details.lines.iter().map(|l| {
+                    (base_font_size * l.height_scale).max(0.05)
+                }).collect();
+
+                let line_spacings: Vec<f64> = line_font_sizes.iter().map(|&sz| sz * 1.3).collect();
+                let cap_height_0 = line_font_sizes.first().copied().unwrap_or(base_font_size) * 0.72;
+                let cap_height_last = line_font_sizes.last().copied().unwrap_or(base_font_size) * 0.72;
+
+                let total_block_h = if num_lines > 1 {
+                    line_spacings[..num_lines - 1].iter().sum::<f64>() + cap_height_last
+                } else {
+                    cap_height_0
+                };
+
+                let v_offset_line0 = if attach_val >= 4 && attach_val <= 6 {
+                    total_block_h / 2.0 - cap_height_0
+                } else if attach_val >= 7 {
+                    if num_lines > 1 {
+                        line_spacings[..num_lines - 1].iter().sum::<f64>()
+                    } else {
+                        0.0
+                    }
+                } else {
+                    -line_font_sizes.first().copied().unwrap_or(base_font_size)
+                };
+
+                let mut cum_y = 0.0;
+                for (idx, line_info) in details.lines.iter().enumerate() {
+                    let font_size = line_font_sizes[idx];
+                    if idx > 0 {
+                        cum_y += line_spacings[idx - 1];
+                    }
+                    if line_info.text.is_empty() {
+                        continue;
+                    }
+                    let font_name = self.select_font_name(line_info.is_bold, line_info.is_italic);
+
+                    let wf = line_info.width_factor;
+                    let tf = line_info.tracking_factor;
+                    let mut char_space = if (tf - 1.0).abs() > 0.01 {
+                        (tf - 1.0) * font_size * 0.55
+                    } else {
+                        0.0
+                    };
+
+                    let num_chars = line_info.text.chars().count();
+                    let tracking_total = char_space * (num_chars.saturating_sub(1) as f64);
+                    let base_w = estimate_str_width(&line_info.text, font_size) * wf;
+                    let mut line_w_pt = base_w + tracking_total;
+
+                    let indent_pt = line_info.indent * transform.scale();
+                    let rect_w_pt = (mtext.rectangle_width * transform.scale()).max(0.0);
+
+                    if line_info.alignment == MTextAlignment::Distributed && rect_w_pt > 0.0 && num_chars > 1 {
+                        let available_w = (rect_w_pt - indent_pt).max(base_w);
+                        if available_w > base_w {
+                            char_space = (available_w - base_w) / (num_chars - 1) as f64;
+                            line_w_pt = available_w;
+                        }
+                    }
+
+                    let h_offset = match line_info.alignment {
+                        MTextAlignment::Distributed => {
+                            if is_center_h {
+                                -line_w_pt / 2.0 + indent_pt
+                            } else if is_right_h {
+                                -line_w_pt + indent_pt
+                            } else {
+                                indent_pt
+                            }
+                        }
+                        MTextAlignment::Center => {
+                            if rect_w_pt > 0.0 {
+                                (rect_w_pt - line_w_pt) / 2.0 + indent_pt
+                            } else if is_center_h {
+                                -line_w_pt / 2.0 + indent_pt
+                            } else if is_right_h {
+                                -line_w_pt + indent_pt
+                            } else {
+                                indent_pt
+                            }
+                        }
+                        MTextAlignment::Right => {
+                            if rect_w_pt > 0.0 {
+                                rect_w_pt - line_w_pt + indent_pt
+                            } else {
+                                -line_w_pt + indent_pt
+                            }
+                        }
+                        _ => {
+                            if is_center_h {
+                                -line_w_pt / 2.0 + indent_pt
+                            } else if is_right_h {
+                                -line_w_pt + indent_pt
+                            } else {
+                                indent_pt
+                            }
+                        }
+                    };
+
+                    let line_y_local = v_offset_line0 - cum_y;
+                    let line_px = px + cos * h_offset - sin * line_y_local;
+                    let line_py = py + sin * h_offset + cos * line_y_local;
+
+                    let escaped = encode_pdf_string(&line_info.text);
+
+                    let mut text_ops = String::new();
+                    let mut reset_ops = String::new();
+                    if char_space.abs() > 0.001 {
+                        text_ops.push_str(&format!("{:.2} Tc\n", char_space));
+                        reset_ops.push_str("0 Tc\n");
+                    }
+                    if (wf - 1.0).abs() > 0.01 {
+                        let tz = (wf * 100.0).clamp(10.0, 500.0);
+                        text_ops.push_str(&format!("{:.1} Tz\n", tz));
+                        reset_ops.push_str("100 Tz\n");
+                    }
 
                     stream.push_str(&format!(
-                        "BT\n/{} {:.2} Tf\n{:.4} {:.4} {:.4} {:.4} {:.2} {:.2} Tm\n({}) Tj\nET\n",
-                        self.primary_font_name, font_size,
+                        "BT\n/{} {:.2} Tf\n{}{:.4} {:.4} {:.4} {:.4} {:.2} {:.2} Tm\n({}) Tj\n{}ET\n",
+                        font_name, font_size,
+                        text_ops,
                         cos, sin, -sin, cos, line_px, line_py,
-                        escaped
+                        escaped,
+                        reset_ops
                     ));
                 }
             }
             EntityType::Hatch(hatch) => {
+                if hatch.paths.is_empty() {
+                    return;
+                }
+                if hatch.is_solid {
+                    Self::ensure_fill(stream, state, r, g, b);
+                } else {
+                    Self::ensure_stroke(stream, state, r, g, b, line_width_pt);
+                }
+
+                let mut has_geometry = false;
                 for path in &hatch.paths {
                     if path.edges.is_empty() {
                         continue;
                     }
-                    if hatch.is_solid {
-                        Self::ensure_fill(stream, state, r, g, b);
-                    } else {
-                        Self::ensure_stroke(stream, state, r, g, b, line_width_pt);
-                    }
+                    has_geometry = true;
                     let mut is_first = true;
                     for edge in &path.edges {
                         match edge {
@@ -1118,14 +1382,9 @@ impl<'a> CadToPdfBuilder<'a> {
                                 let (cx, cy) = transform.apply(arc.center.x, arc.center.y);
                                 let r_rad = arc.radius * transform.scale();
                                 let rot = transform.rotation_radians();
-                                let start_rad = arc.start_angle.to_radians() + rot;
-                                let end_rad = arc.end_angle.to_radians() + rot;
-                                if is_first {
-                                    let sx = cx + r_rad * start_rad.cos();
-                                    let sy = cy + r_rad * start_rad.sin();
-                                    stream.push_str(&format!("{:.2} {:.2} m\n", sx, sy));
-                                    is_first = false;
-                                }
+                                let start_rad = arc.start_angle + rot;
+                                let end_rad = arc.end_angle + rot;
+                                is_first = false;
                                 stream.push_str(&generate_arc_path(cx, cy, r_rad, start_rad, end_rad));
                             }
                             BoundaryEdge::EllipticArc(el) => {
@@ -1138,8 +1397,8 @@ impl<'a> CadToPdfBuilder<'a> {
                                     maj_x,
                                     maj_y,
                                     el.minor_axis_ratio,
-                                    el.start_angle.to_radians(),
-                                    el.end_angle.to_radians(),
+                                    el.start_angle,
+                                    el.end_angle,
                                 ));
                                 is_first = false;
                             }
@@ -1175,10 +1434,14 @@ impl<'a> CadToPdfBuilder<'a> {
                             }
                         }
                     }
+                    stream.push_str("h\n");
+                }
+
+                if has_geometry {
                     if hatch.is_solid {
-                        stream.push_str("h f\n");
+                        stream.push_str("f*\n");
                     } else {
-                        stream.push_str("h S\n");
+                        stream.push_str("S\n");
                     }
                 }
             }
@@ -1292,8 +1555,14 @@ fn encode_pdf_string(s: &str) -> String {
             '\t' => out.push_str(r"\t"),
             ' '..='~' => out.push(ch),
             _ => {
+                if ch == '\u{2028}' || ch == '\u{2029}' || ch == '\u{feff}' || ch == '\u{200b}' {
+                    // Zero-width or unicode line breaks - do not emit '?'
+                    continue;
+                }
                 if let Some(byte) = char_to_winansi(ch) {
                     out.push_str(&format!("\\{:03o}", byte));
+                } else if ch.is_whitespace() || ch.is_control() {
+                    out.push(' ');
                 } else {
                     out.push('?');
                 }
