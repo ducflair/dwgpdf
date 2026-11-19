@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "Convert DXF, DWG, and DWF drawings to PDF",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ducflair/dwgpdf"
+  },
   "type": "module",
   "sideEffects": false,
   "files": [

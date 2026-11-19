@@ -81,9 +81,6 @@ cargo test
 
 Tests use checked-in official DXF, DWG, and DWF fixtures. They do not download external data or scan or convert files in `tests/fixtures/local/`. One isolated test checks local-folder discovery and conversion using a temporary directory and a copy of a checked-in fixture.
 
-## Releases
-
-Releases are generated from Conventional Commits on `main`: `fix:` creates a patch release, `feat:` a minor release, and a `BREAKING CHANGE:` footer creates a major release. The release workflow publishes the matching version to npm and crates.io and attaches both package archives to the GitHub Release. Configure the repository secrets `NPM_TOKEN` and `CARGO_REGISTRY_TOKEN`; GitHub Releases use the workflow's `GITHUB_TOKEN`.
 
 ## License
 
