@@ -3,14 +3,17 @@ tests/tests_output/
 *.pdf
 .DS_Store
 
-# User's local / extra CAD fixtures - remained untouched and uncommitted
+# Personal local fixtures are kept out of the regular test suite and Git.
 tests/fixtures/local/*
 !tests/fixtures/local/README.md
 !tests/fixtures/local/.gitkeep
-tests/fixtures/extra/
-tests/fixtures/custom/
+tests/fixtures/*.png
 tests/fixtures/**/*.local.*
 tests/fixtures/*.local.*
 *.local.dxf
 *.local.dwg
 *.local.dwf
+/pkg/
+/node_modules/
+/.release-assets/
+*.tgz

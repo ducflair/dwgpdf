@@ -44,7 +44,7 @@ struct Cli {
     #[arg(long)]
     author: Option<String>,
 
-    /// Enable CAD entity and layer lineweights (by default lines are rendered as uniform thin hairlines like Three.js/CAD canvas)
+    /// Enable CAD entity and layer lineweights (by default lines are rendered as uniform thin hairlines like Three.js/CAD canvas; DWF plotted lineweights are always honored)
     #[arg(long, default_value_t = false)]
     use_lineweights: bool,
 

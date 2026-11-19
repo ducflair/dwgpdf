@@ -17,7 +17,34 @@ impl LineDashPattern {
         self.dash_array.is_empty()
     }
 
-    /// Converts line type name (e.g. "DASHED", "CENTER", "HIDDEN", "CONTINUOUS")
+    /// Converts CAD linetype elements to PDF dash pattern.
+    pub fn from_elements(elements: &[acadrust::tables::LineTypeElement], scale: f32) -> Self {
+        if elements.is_empty() {
+            return Self::solid();
+        }
+        let mut s = scale.max(0.001);
+        let raw_period: f32 = elements.iter().map(|e| e.length.abs() as f32).sum();
+        if raw_period > 0.0 && raw_period * s < 4.0 {
+            s = 4.0 / raw_period;
+        }
+        let dashes: Vec<f32> = elements
+            .iter()
+            .map(|e| {
+                let d = e.length.abs() as f32;
+                if d == 0.0 {
+                    0.0
+                } else {
+                    (d * s).max(0.3)
+                }
+            })
+            .collect();
+        Self {
+            dash_array: dashes,
+            phase: 0.0,
+        }
+    }
+
+    /// Converts line type name (e.g. "DASHED", "CENTER", "HIDDEN", "CONTINUOUS", "1mm DASH")
     /// to PDF dash pattern, scaled by scale factor.
     pub fn from_name(name: &str, scale: f32) -> Self {
         let upper = name.to_uppercase();
@@ -30,7 +57,7 @@ impl LineDashPattern {
                 dash_array: vec![10.0 * s, 3.0 * s, 2.0 * s, 3.0 * s],
                 phase: 0.0,
             }
-        } else if upper.contains("DASHED") {
+        } else if upper.contains("DASH") || upper.contains("TRAC") || upper.contains("TRAÇ") {
             Self {
                 dash_array: vec![8.0 * s, 4.0 * s],
                 phase: 0.0,
@@ -45,7 +72,7 @@ impl LineDashPattern {
                 dash_array: vec![4.0 * s, 2.0 * s],
                 phase: 0.0,
             }
-        } else if upper.contains("CENTER") {
+        } else if upper.contains("CENTER") || upper.contains("AXIS") || upper.contains("EIXO") {
             Self {
                 dash_array: vec![12.0 * s, 3.0 * s, 3.0 * s, 3.0 * s],
                 phase: 0.0,

@@ -3,8 +3,24 @@ name = "dwgpdf"
 version = "0.1.0"
 edition = "2021"
 authors = ["Ducflair"]
-description = "High-performance CAD (DXF, DWG, DWF) to PDF converter in Rust using hipdf"
+description = "Convert DXF, DWG, and DWF drawings to PDF"
 license = "MIT"
+readme = "README.md"
+documentation = "https://docs.rs/dwgpdf"
+keywords = ["cad", "dwg", "dxf", "pdf", "wasm"]
+exclude = [
+    "tests/**",
+    "examples/**",
+    "docs/**",
+    "scripts/**",
+    "SUMMARY.md",
+    ".gitignore",
+    "package.json",
+    "package-lock.json",
+    "index.d.ts",
+    "pkg/**",
+    "node_modules/**",
+]
 
 [lib]
 name = "dwgpdf"
@@ -18,12 +34,10 @@ path = "src/main.rs"
 [dependencies]
 hipdf = "1.3.8"
 acadrust = "0.5.5"
-dxf = "0.6.1"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 roxmltree = "0.20"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 thiserror = "2.0"
 log = "0.4"
 clap = { version = "4.5", features = ["derive"], optional = true }
@@ -31,3 +45,12 @@ clap = { version = "4.5", features = ["derive"], optional = true }
 [features]
 default = ["cli"]
 cli = ["dep:clap"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+serde-wasm-bindgen = "0.6"
+uuid = { version = "1", features = ["js"] }
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

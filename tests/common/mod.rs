@@ -1,11 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Once;
-
-static INIT_FIXTURES: Once = Once::new();
-
-pub const FIXTURE_BASE_URL: &str = "https://raw.githubusercontent.com/ducflair/fixtures/main/src";
 
 pub const OFFICIAL_DXF_FILES: &[&str] = &[
     "columns_R2007.dxf",
@@ -33,9 +27,7 @@ pub const OFFICIAL_DWG_FILES: &[&str] = &[
     "sample_AC1032.dwg",
 ];
 
-pub const OFFICIAL_DWF_FILES: &[&str] = &[
-    "FlyAshSystem.dwf",
-];
+pub const OFFICIAL_DWF_FILES: &[&str] = &["FlyAshSystem.dwf"];
 
 pub fn fixtures_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -52,115 +44,60 @@ pub fn save_test_output(name: &str, pdf_bytes: &[u8]) {
     if let Some(parent) = out_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    let _ = fs::write(out_path, pdf_bytes);
-}
-
-/// Ensures all official fixtures are available in `tests/fixtures/`.
-/// If any file is missing, it tries copying from a local checkout or downloads via curl.
-/// Local user-provided files are never touched or modified.
-pub fn ensure_fixtures() {
-    INIT_FIXTURES.call_once(|| {
-        let root = fixtures_root();
-        let _ = fs::create_dir_all(root.join("dxf"));
-        let _ = fs::create_dir_all(root.join("dwg"));
-        let _ = fs::create_dir_all(root.join("dwf"));
-        let _ = fs::create_dir_all(root.join("local"));
-
-        let local_src_candidates = [
-            std::env::var("FIXTURES_DIR").ok().map(PathBuf::from),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().map(|p| p.join("fixtures/src")),
-        ];
-
-        let sync_group = |files: &[&str], subfolder: &str, remote_folder: &str| {
-            let target_dir = root.join(subfolder);
-            for file in files {
-                let target_path = target_dir.join(file);
-                if target_path.exists() && fs::metadata(&target_path).map(|m| m.len()).unwrap_or(0) > 0 {
-                    continue; // Already present, leave untouched
-                }
-
-                // 1. Try local mirror first
-                let mut copied = false;
-                for cand in local_src_candidates.iter().flatten() {
-                    let src_file = cand.join(remote_folder).join(file);
-                    if src_file.exists() && fs::metadata(&src_file).map(|m| m.len()).unwrap_or(0) > 0 {
-                        if fs::copy(&src_file, &target_path).is_ok() {
-                            copied = true;
-                            break;
-                        }
-                    }
-                }
-
-                // 2. Fall back to downloading from GitHub
-                if !copied {
-                    let url = format!("{}/{}/{}", FIXTURE_BASE_URL, remote_folder, file);
-                    let status = Command::new("curl")
-                        .args(["-fsSL", &url, "-o", target_path.to_str().unwrap()])
-                        .status();
-                    if let Ok(st) = status {
-                        if !st.success() {
-                            eprintln!("Warning: Failed to fetch fixture from {}", url);
-                        }
-                    }
-                }
-            }
-        };
-
-        sync_group(OFFICIAL_DXF_FILES, "dxf", "dxf-files");
-        sync_group(OFFICIAL_DWG_FILES, "dwg", "dwg-files");
-        sync_group(OFFICIAL_DWF_FILES, "dwf", "dwf-files");
-    });
-}
-
-/// Recursively finds all CAD files matching a specific extension.
-/// Scans both the standard type directory and the `local` directory.
-pub fn find_fixtures_with_ext(ext: &str) -> Vec<PathBuf> {
-    ensure_fixtures();
-    let root = fixtures_root();
-    let mut results = Vec::new();
-
-    let scan_dir = |dir: &Path, results: &mut Vec<PathBuf>| {
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(file_ext) = path.extension() {
-                        if file_ext.eq_ignore_ascii_case(ext) {
-                            results.push(path);
-                        }
-                    }
-                }
-            }
-        }
-    };
-
-    let target_sub = match ext.to_lowercase().as_str() {
-        "dxf" => "dxf",
-        "dwg" => "dwg",
-        "dwf" => "dwf",
-        _ => "",
-    };
-
-    if !target_sub.is_empty() {
-        scan_dir(&root.join(target_sub), &mut results);
+    if let Err(e) = fs::write(&out_path, pdf_bytes) {
+        eprintln!(
+            "Warning: failed to write test output {}: {:?}",
+            out_path.display(),
+            e
+        );
     }
-    // Also scan `local` for user-added files
-    scan_dir(&root.join("local"), &mut results);
+}
 
+/// Returns only the fixed official fixtures used by the repeatable integration suite.
+fn official_fixtures_with_ext(ext: &str) -> Vec<PathBuf> {
+    let root = fixtures_root();
+    let (subdirectory, files) = match ext.to_ascii_lowercase().as_str() {
+        "dxf" => ("dxf", OFFICIAL_DXF_FILES),
+        "dwg" => ("dwg", OFFICIAL_DWG_FILES),
+        "dwf" => ("dwf", OFFICIAL_DWF_FILES),
+        _ => return Vec::new(),
+    };
+
+    files
+        .iter()
+        .map(|name| root.join(subdirectory).join(name))
+        .collect()
+}
+
+/// Finds fixtures in a caller-provided `local/` directory.
+/// The routine integration tests do not call this for the repository's user folder.
+pub fn find_local_fixtures_with_ext(root: &Path, ext: &str) -> Vec<PathBuf> {
+    let local_dir = root.join("local");
+    let mut results = fs::read_dir(local_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|file_ext| file_ext.eq_ignore_ascii_case(ext))
+        })
+        .collect::<Vec<_>>();
     results.sort();
     results
 }
 
 pub fn get_all_dxf_fixtures() -> Vec<PathBuf> {
-    find_fixtures_with_ext("dxf")
+    official_fixtures_with_ext("dxf")
 }
 
 pub fn get_all_dwg_fixtures() -> Vec<PathBuf> {
-    find_fixtures_with_ext("dwg")
+    official_fixtures_with_ext("dwg")
 }
 
 pub fn get_all_dwf_fixtures() -> Vec<PathBuf> {
-    find_fixtures_with_ext("dwf")
+    official_fixtures_with_ext("dwf")
 }
 
 /// Validates that the generated PDF data is compliant:
@@ -169,10 +106,18 @@ pub fn get_all_dwf_fixtures() -> Vec<PathBuf> {
 /// 3. Ends with '%%EOF' trailer marker
 /// 4. Can be parsed back by lopdf into a valid Document structure
 pub fn validate_pdf(data: &[u8]) {
-    assert!(data.len() > 100, "PDF byte length too small: {} bytes", data.len());
+    assert!(
+        data.len() > 100,
+        "PDF byte length too small: {} bytes",
+        data.len()
+    );
 
     let header = std::str::from_utf8(&data[..8.min(data.len())]).unwrap_or("");
-    assert!(header.starts_with("%PDF-"), "Invalid PDF header: {}", header);
+    assert!(
+        header.starts_with("%PDF-"),
+        "Invalid PDF header: {}",
+        header
+    );
 
     let tail_len = 32.min(data.len());
     let tail_slice = &data[data.len() - tail_len..];
@@ -184,12 +129,14 @@ pub fn validate_pdf(data: &[u8]) {
     );
 
     // Validate that lopdf can parse the document structure
-    let doc = hipdf::lopdf::Document::load_mem(data)
-        .expect("Generated PDF must be parseable by lopdf");
+    let doc =
+        hipdf::lopdf::Document::load_mem(data).expect("Generated PDF must be parseable by lopdf");
     assert!(!doc.objects.is_empty(), "PDF must contain objects");
 
     // Verify Catalog exists
-    let catalog = doc.catalog().expect("PDF must contain a valid Catalog dictionary");
+    let catalog = doc
+        .catalog()
+        .expect("PDF must contain a valid Catalog dictionary");
     assert!(
         catalog.get(b"Pages").is_ok(),
         "PDF Catalog must reference Pages"

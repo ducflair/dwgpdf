@@ -63,9 +63,29 @@ pub fn resolve_color(
                     default_rgb
                 }
             } else if *idx == 7 {
-                // In AutoCAD, Color 7 is white on dark background and black on white background.
-                // For white page background, return black.
-                (0, 0, 0)
+                // In AutoCAD, Color 7 is monochrome foreground: black on light background, white on dark background.
+                // It dynamically adopts the default drawing foreground color.
+                default_rgb
+            } else if *idx == 255 {
+                // Color 255 in AutoCAD maps to foreground when drawn on a light background.
+                if default_rgb == (0, 0, 0) {
+                    (0, 0, 0)
+                } else {
+                    (255, 255, 255)
+                }
+            } else if *idx >= 250 && *idx <= 254 && default_rgb == (0, 0, 0) {
+                // In AutoCAD plot style tables (e.g. monochrome.ctb / acad.ctb / screening),
+                // light grays (250-254) are mapped to screened dark gray pens for contrast on white paper.
+                // ACI 254 (0xD6D6D6 = 214) washes out against white paper (contrast ratio 1.3:1).
+                // Clamp luminance so that text and annotations are clearly legible on white paper:
+                match *idx {
+                    250 => (51, 51, 51),
+                    251 => (70, 70, 70),
+                    252 => (85, 85, 85),
+                    253 => (105, 105, 105),
+                    254 => (120, 120, 120),
+                    _ => aci_to_rgb(*idx),
+                }
             } else {
                 aci_to_rgb(*idx)
             }

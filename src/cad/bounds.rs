@@ -1,7 +1,8 @@
 use acadrust::document::CadDocument;
 use acadrust::entities::{BoundaryEdge, EntityType};
+use acadrust::types::Matrix3;
+use acadrust::Vector3;
 use std::collections::HashMap;
-use std::f64;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BoundingBox {
@@ -140,10 +141,21 @@ impl Transform2D {
         self.b.atan2(self.a)
     }
 
+    pub fn is_reflected(&self) -> bool {
+        (self.a * self.d - self.b * self.c) < 0.0
+    }
+
     pub fn apply(&self, x: f64, y: f64) -> (f64, f64) {
         (
             self.a * x + self.c * y + self.tx,
             self.b * x + self.d * y + self.ty,
+        )
+    }
+
+    pub fn apply_delta(&self, dx: f64, dy: f64) -> (f64, f64) {
+        (
+            self.a * dx + self.c * dy,
+            self.b * dx + self.d * dy,
         )
     }
 
@@ -181,7 +193,7 @@ pub fn calculate_document_bounds(
         if layer_name.eq_ignore_ascii_case("defpoints") {
             continue;
         }
-        if let Some(layer) = doc.layers.iter().find(|l| l.name == layer_name) {
+        if let Some(layer) = doc.layers.iter().find(|l| l.name.eq_ignore_ascii_case(layer_name)) {
             if !layer.is_plottable || layer.is_frozen() || layer.is_off() {
                 continue;
             }
@@ -189,7 +201,7 @@ pub fn calculate_document_bounds(
 
         let mut ent_box = BoundingBox::new();
         let mut visited_blocks = std::collections::HashSet::new();
-        accumulate_entity_bounds(doc, entity, &Transform2D::identity(), &mut ent_box, &mut visited_blocks, 0);
+        accumulate_entity_bounds(doc, entity, &Transform2D::identity(), &mut ent_box, &mut visited_blocks, 0, None);
         if ent_box.is_valid() {
             entity_boxes.push(ent_box);
         }
@@ -230,15 +242,39 @@ pub fn calculate_document_bounds(
     let q3_y = ys[q3_idx];
     let iqr_y = (q3_y - q1_y).max(1.0);
 
-    // Multiplier of 3.0 represents Tukey's outer fence ("extreme outliers")
-    let lower_x = q1_x - 3.0 * iqr_x;
-    let upper_x = q3_x + 3.0 * iqr_x;
-    let lower_y = q1_y - 3.0 * iqr_y;
-    let upper_y = q3_y + 3.0 * iqr_y;
+    let scale = iqr_x.max(iqr_y);
+    let eff_iqr_x = iqr_x.max(scale * 0.25);
+    let eff_iqr_y = iqr_y.max(scale * 0.25);
+
+    let mut lower_x = q1_x - 15.0 * eff_iqr_x;
+    let mut upper_x = q3_x + 15.0 * eff_iqr_x;
+    let mut lower_y = q1_y - 15.0 * eff_iqr_y;
+    let mut upper_y = q3_y + 15.0 * eff_iqr_y;
+
+    // Respect valid AutoCAD header extents only if they are not extreme outliers
+    let h_min = doc.header.model_space_extents_min;
+    let h_max = doc.header.model_space_extents_max;
+    if h_max.x > h_min.x && h_max.y > h_min.y {
+        let h_span_x = h_max.x - h_min.x;
+        let h_span_y = h_max.y - h_min.y;
+        if h_span_x <= 25.0 * eff_iqr_x && h_span_y <= 25.0 * eff_iqr_y
+            && h_min.x >= q1_x - 20.0 * eff_iqr_x && h_max.x <= q3_x + 20.0 * eff_iqr_x
+            && h_min.y >= q1_y - 20.0 * eff_iqr_y && h_max.y <= q3_y + 20.0 * eff_iqr_y
+        {
+            lower_x = lower_x.min(h_min.x - 10.0);
+            upper_x = upper_x.max(h_max.x + 10.0);
+            lower_y = lower_y.min(h_min.y - 10.0);
+            upper_y = upper_y.max(h_max.y + 10.0);
+        }
+    }
 
     let mut inlier_bbox = BoundingBox::new();
     let mut inlier_count = 0;
     for b in &entity_boxes {
+        // Reject entities that are individually hundreds of times larger than the IQR
+        if b.width() > 50.0 * eff_iqr_x || b.height() > 50.0 * eff_iqr_y {
+            continue;
+        }
         let cx = (b.min_x + b.max_x) * 0.5;
         let cy = (b.min_y + b.max_y) * 0.5;
         if cx >= lower_x && cx <= upper_x && cy >= lower_y && cy <= upper_y {
@@ -272,12 +308,15 @@ pub fn calculate_block_bounds(doc: &CadDocument, block_name: &str) -> BoundingBo
         if layer_name.eq_ignore_ascii_case("defpoints") {
             continue;
         }
-        if let Some(layer) = doc.layers.iter().find(|l| l.name == layer_name) {
+        if let Some(layer) = doc.layers.iter().find(|l| l.name.eq_ignore_ascii_case(layer_name)) {
             if !layer.is_plottable || layer.is_frozen() || layer.is_off() {
                 continue;
             }
         }
-        accumulate_entity_bounds(doc, entity, &Transform2D::identity(), &mut bbox, &mut visited, 0);
+        if matches!(entity, EntityType::AttributeDefinition(_)) {
+            continue;
+        }
+        accumulate_entity_bounds(doc, entity, &Transform2D::identity(), &mut bbox, &mut visited, 0, None);
     }
     bbox
 }
@@ -289,6 +328,7 @@ pub fn accumulate_entity_bounds(
     bbox: &mut BoundingBox,
     visited_blocks: &mut std::collections::HashSet<String>,
     depth: usize,
+    parent_layer: Option<&str>,
 ) {
     if depth > 32 {
         return;
@@ -299,11 +339,17 @@ pub fn accumulate_entity_bounds(
         return;
     }
 
-    let layer_name = dyn_ent.layer();
+    let raw_layer = dyn_ent.layer();
+    let layer_name = if raw_layer == "0" {
+        parent_layer.unwrap_or(raw_layer)
+    } else {
+        raw_layer
+    };
+
     if layer_name.eq_ignore_ascii_case("defpoints") {
         return;
     }
-    if let Some(layer) = doc.layers.iter().find(|l| l.name == layer_name) {
+    if let Some(layer) = doc.layers.iter().find(|l| l.name.eq_ignore_ascii_case(layer_name)) {
         if !layer.is_plottable || layer.is_frozen() || layer.is_off() {
             return;
         }
@@ -317,13 +363,15 @@ pub fn accumulate_entity_bounds(
             bbox.update_point(x2, y2);
         }
         EntityType::Circle(circle) => {
-            let (cx, cy) = transform.apply(circle.center.x, circle.center.y);
+            let center = circle.center_wcs();
+            let (cx, cy) = transform.apply(center.x, center.y);
             let r = circle.radius * transform.scale();
             bbox.update_point(cx - r, cy - r);
             bbox.update_point(cx + r, cy + r);
         }
         EntityType::Arc(arc) => {
-            let (cx, cy) = transform.apply(arc.center.x, arc.center.y);
+            let center = arc.center_wcs();
+            let (cx, cy) = transform.apply(center.x, center.y);
             let r = arc.radius * transform.scale();
             bbox.update_point(cx - r, cy - r);
             bbox.update_point(cx + r, cy + r);
@@ -339,6 +387,27 @@ pub fn accumulate_entity_bounds(
             for v in &lwpoly.vertices {
                 let (x, y) = transform.apply(v.location.x, v.location.y);
                 bbox.update_point(x, y);
+            }
+            for i in 0..lwpoly.vertices.len() {
+                let v1 = &lwpoly.vertices[i];
+                if v1.bulge.abs() > 1e-6 {
+                    let next_idx = if i + 1 < lwpoly.vertices.len() {
+                        i + 1
+                    } else if lwpoly.is_closed {
+                        0
+                    } else {
+                        continue;
+                    };
+                    let v2 = &lwpoly.vertices[next_idx];
+                    let mx = (v1.location.x + v2.location.x) / 2.0;
+                    let my = (v1.location.y + v2.location.y) / 2.0;
+                    let dx = v2.location.x - v1.location.x;
+                    let dy = v2.location.y - v1.location.y;
+                    let crest_x = mx - dy * v1.bulge * 0.5;
+                    let crest_y = my + dx * v1.bulge * 0.5;
+                    let (tx, ty) = transform.apply(crest_x, crest_y);
+                    bbox.update_point(tx, ty);
+                }
             }
         }
         EntityType::Polyline(poly) => {
@@ -361,7 +430,19 @@ pub fn accumulate_entity_bounds(
         }
         EntityType::Point(pt) => {
             let (x, y) = transform.apply(pt.location.x, pt.location.y);
-            bbox.update_point(x, y);
+            let pd_size = doc.header.point_display_size;
+            let mode = doc.header.point_display_mode;
+            if mode != 1 {
+                let r = if pd_size > 0.0 {
+                    pd_size * 0.5 * transform.scale()
+                } else {
+                    1.0
+                };
+                bbox.update_point(x - r, y - r);
+                bbox.update_point(x + r, y + r);
+            } else {
+                bbox.update_point(x, y);
+            }
         }
         EntityType::Solid(solid) => {
             let (x1, y1) = transform.apply(solid.first_corner.x, solid.first_corner.y);
@@ -384,22 +465,101 @@ pub fn accumulate_entity_bounds(
             bbox.update_point(x4, y4);
         }
         EntityType::Text(txt) => {
-            let (x, y) = transform.apply(txt.insertion_point.x, txt.insertion_point.y);
-            let h = (txt.height * transform.scale()).max(0.1);
-            let w = (txt.value.len() as f64) * h * 0.7;
-            bbox.update_point(x, y);
-            bbox.update_point(x + w, y + h);
+            let m = Matrix3::arbitrary_axis(txt.normal);
+            let p0 = m.transform_point(txt.insertion_point);
+            let u = m.transform_point(Vector3::new(txt.rotation.cos(), txt.rotation.sin(), 0.0));
+            let v = m.transform_point(Vector3::new(-txt.rotation.sin(), txt.rotation.cos(), 0.0));
+            let flip_x = if (txt.generation_flags & 2) != 0 { -1.0 } else { 1.0 };
+            let flip_y = if (txt.generation_flags & 4) != 0 { -1.0 } else { 1.0 };
+            let ux = u.x * flip_x;
+            let uy = u.y * flip_x;
+            let vx = v.x * flip_y;
+            let vy = v.y * flip_y;
+            let w = (txt.value.len() as f64) * txt.height * 0.7 * txt.width_factor.max(0.1);
+            let h = txt.height.max(0.1);
+            for &(dx, dy) in &[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)] {
+                let wx = p0.x + dx * ux + dy * vx;
+                let wy = p0.y + dx * uy + dy * vy;
+                let (tx, ty) = transform.apply(wx, wy);
+                bbox.update_point(tx, ty);
+            }
+            if let Some(ref ap) = txt.alignment_point {
+                let ap_w = m.transform_point(*ap);
+                let (ax, ay) = transform.apply(ap_w.x, ap_w.y);
+                bbox.update_point(ax, ay);
+            }
+        }
+        EntityType::AttributeDefinition(attdef) => {
+            if depth > 0 || attdef.flags.invisible || attdef.default_value.trim().is_empty() {
+                return;
+            }
+            let m = Matrix3::arbitrary_axis(attdef.normal);
+            let p0 = m.transform_point(attdef.insertion_point);
+            let u = m.transform_point(Vector3::new(attdef.rotation.cos(), attdef.rotation.sin(), 0.0));
+            let v = m.transform_point(Vector3::new(-attdef.rotation.sin(), attdef.rotation.cos(), 0.0));
+            let flip_x = if (attdef.text_generation_flags & 2) != 0 { -1.0 } else { 1.0 };
+            let flip_y = if (attdef.text_generation_flags & 4) != 0 { -1.0 } else { 1.0 };
+            let ux = u.x * flip_x;
+            let uy = u.y * flip_x;
+            let vx = v.x * flip_y;
+            let vy = v.y * flip_y;
+            let val = attdef.default_value.trim();
+            let w = (val.len() as f64) * attdef.height * 0.7 * attdef.width_factor.max(0.1);
+            let h = attdef.height.max(0.1);
+            for &(dx, dy) in &[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)] {
+                let wx = p0.x + dx * ux + dy * vx;
+                let wy = p0.y + dx * uy + dy * vy;
+                let (tx, ty) = transform.apply(wx, wy);
+                bbox.update_point(tx, ty);
+            }
+            let ap_w = m.transform_point(attdef.alignment_point);
+            let (ax, ay) = transform.apply(ap_w.x, ap_w.y);
+            bbox.update_point(ax, ay);
+        }
+        EntityType::AttributeEntity(attrib) => {
+            if attrib.flags.invisible || attrib.value.trim().is_empty() {
+                return;
+            }
+            let m = Matrix3::arbitrary_axis(attrib.normal);
+            let p0 = m.transform_point(attrib.insertion_point);
+            let u = m.transform_point(Vector3::new(attrib.rotation.cos(), attrib.rotation.sin(), 0.0));
+            let v = m.transform_point(Vector3::new(-attrib.rotation.sin(), attrib.rotation.cos(), 0.0));
+            let flip_x = if (attrib.text_generation_flags & 2) != 0 { -1.0 } else { 1.0 };
+            let flip_y = if (attrib.text_generation_flags & 4) != 0 { -1.0 } else { 1.0 };
+            let ux = u.x * flip_x;
+            let uy = u.y * flip_x;
+            let vx = v.x * flip_y;
+            let vy = v.y * flip_y;
+            let val = attrib.value.trim();
+            let w = (val.len() as f64) * attrib.height * 0.7 * attrib.width_factor.max(0.1);
+            let h = attrib.height.max(0.1);
+            for &(dx, dy) in &[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)] {
+                let wx = p0.x + dx * ux + dy * vx;
+                let wy = p0.y + dx * uy + dy * vy;
+                let (tx, ty) = transform.apply(wx, wy);
+                bbox.update_point(tx, ty);
+            }
+            let ap_w = m.transform_point(attrib.alignment_point);
+            let (ax, ay) = transform.apply(ap_w.x, ap_w.y);
+            bbox.update_point(ax, ay);
         }
         EntityType::MText(mtext) => {
-            let (x, y) = transform.apply(mtext.insertion_point.x, mtext.insertion_point.y);
-            let h = (mtext.height * transform.scale()).max(0.1);
+            let p0 = mtext.insertion_point;
+            let sign_z = if mtext.normal.z.is_sign_negative() { -1.0 } else { 1.0 };
+            let u = Vector3::new(mtext.rotation.cos(), mtext.rotation.sin(), 0.0);
+            let v = Vector3::new(-mtext.rotation.sin() * sign_z, mtext.rotation.cos() * sign_z, 0.0);
             let w = if mtext.rectangle_width > 0.0 {
-                mtext.rectangle_width * transform.scale()
+                mtext.rectangle_width
             } else {
-                (mtext.value.len() as f64) * h * 0.7
+                (mtext.value.len() as f64) * mtext.height * 0.7
             };
-            bbox.update_point(x, y);
-            bbox.update_point(x + w, y - h);
+            let h = mtext.height.max(0.1);
+            for &(dx, dy) in &[(0.0, 0.0), (w, 0.0), (w, -h), (0.0, -h)] {
+                let wx = p0.x + dx * u.x + dy * v.x;
+                let wy = p0.y + dx * u.y + dy * v.y;
+                let (tx, ty) = transform.apply(wx, wy);
+                bbox.update_point(tx, ty);
+            }
         }
         EntityType::Hatch(hatch) => {
             for path in &hatch.paths {
@@ -456,30 +616,177 @@ pub fn accumulate_entity_bounds(
             }
         }
         EntityType::Insert(insert) => {
-            let insert_transform = Transform2D::from_trs(
-                insert.insert_point.x,
-                insert.insert_point.y,
-                insert.rotation,
-                insert.x_scale(),
-                insert.y_scale(),
-            );
-            let combined = transform.combine(&insert_transform);
+            let base_pt = doc
+                .block_records
+                .get(&insert.block_name)
+                .map(|b| b.base_point)
+                .unwrap_or(acadrust::Vector3::ZERO);
+
+            let base_transform = Transform2D::from_scale_and_translation(1.0, -base_pt.x, -base_pt.y);
+
+            let cols = insert.column_count.max(1) as usize;
+            let rows = insert.row_count.max(1) as usize;
+            let col_spacing = insert.column_spacing;
+            let row_spacing = insert.row_spacing;
+            let cos_rot = insert.rotation.cos();
+            let sin_rot = insert.rotation.sin();
 
             let block_name = &insert.block_name;
             if visited_blocks.insert(block_name.clone()) {
-                for block_ent in doc.entities_in_block(block_name) {
-                    accumulate_entity_bounds(doc, block_ent, &combined, bbox, visited_blocks, depth + 1);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let dx = (c as f64) * col_spacing * cos_rot - (r as f64) * row_spacing * sin_rot;
+                        let dy = (c as f64) * col_spacing * sin_rot + (r as f64) * row_spacing * cos_rot;
+
+                        let insert_transform = Transform2D::from_trs(
+                            insert.insert_point.x + dx,
+                            insert.insert_point.y + dy,
+                            insert.rotation,
+                            insert.x_scale(),
+                            insert.y_scale(),
+                        );
+                        let combined = transform.combine(&insert_transform.combine(&base_transform));
+
+                        for block_ent in doc.entities_in_block(block_name) {
+                            if matches!(block_ent, EntityType::AttributeDefinition(_)) {
+                                continue;
+                            }
+                            accumulate_entity_bounds(doc, block_ent, &combined, bbox, visited_blocks, depth + 1, Some(layer_name));
+                        }
+                    }
                 }
                 visited_blocks.remove(block_name);
+            }
+            for attrib in &insert.attributes {
+                let dummy_ent = EntityType::AttributeEntity(attrib.clone());
+                accumulate_entity_bounds(doc, &dummy_ent, transform, bbox, visited_blocks, depth, None);
             }
         }
         EntityType::Dimension(dim) => {
             let block_name = &dim.base().block_name;
             if !block_name.is_empty() && visited_blocks.insert(block_name.clone()) {
                 for block_ent in doc.entities_in_block(block_name) {
-                    accumulate_entity_bounds(doc, block_ent, transform, bbox, visited_blocks, depth + 1);
+                    accumulate_entity_bounds(doc, block_ent, transform, bbox, visited_blocks, depth + 1, None);
                 }
                 visited_blocks.remove(block_name);
+            }
+        }
+        EntityType::PolyfaceMesh(p) => {
+            for v in &p.vertices {
+                let (x, y) = transform.apply(v.location.x, v.location.y);
+                bbox.update_point(x, y);
+            }
+        }
+        EntityType::Mesh(m) => {
+            for v in &m.vertices {
+                let (x, y) = transform.apply(v.x, v.y);
+                bbox.update_point(x, y);
+            }
+        }
+        EntityType::MultiLeader(ml) => {
+            for root in &ml.context.leader_roots {
+                let (cx, cy) = transform.apply(root.connection_point.x, root.connection_point.y);
+                bbox.update_point(cx, cy);
+                for line in &root.lines {
+                    for pt in &line.points {
+                        let (px, py) = transform.apply(pt.x, pt.y);
+                        bbox.update_point(px, py);
+                    }
+                }
+            }
+            if ml.context.has_text_contents && !ml.context.text_string.is_empty() {
+                let (tx, ty) = transform.apply(ml.context.text_location.x, ml.context.text_location.y);
+                let h = (ml.context.text_height * transform.scale()).max(0.1);
+                let w = (ml.context.text_string.len() as f64) * h * 0.7;
+                bbox.update_point(tx, ty);
+                bbox.update_point(tx + w, ty + h);
+            }
+            if ml.context.has_block_contents || ml.content_type == acadrust::entities::multileader::LeaderContentType::Block {
+                let block_handle = ml.context.block_content_handle.or(ml.block_content_handle);
+                let block_name = block_handle.and_then(|h| {
+                    doc.block_records.iter().find(|br| br.handle == h).map(|br| br.name.clone())
+                });
+                if let Some(bname) = block_name {
+                    let loc = ml.context.block_content_location;
+                    let rot = ml.context.block_rotation;
+                    let scale = ml.context.block_content_scale;
+                    let base_pt = doc.block_records.get(&bname).map(|b| b.base_point).unwrap_or(acadrust::Vector3::ZERO);
+                    let base_transform = Transform2D::from_scale_and_translation(1.0, -base_pt.x, -base_pt.y);
+                    let insert_transform = Transform2D::from_trs(loc.x, loc.y, rot, scale.x, scale.y);
+                    let combined = transform.combine(&insert_transform.combine(&base_transform));
+
+                    if visited_blocks.insert(bname.clone()) {
+                        for block_ent in doc.entities_in_block(&bname) {
+                            if matches!(block_ent, EntityType::AttributeDefinition(_)) {
+                                continue;
+                            }
+                            accumulate_entity_bounds(doc, block_ent, &combined, bbox, visited_blocks, depth + 1, Some(layer_name));
+                        }
+                        visited_blocks.remove(&bname);
+                    }
+                }
+            }
+        }
+        EntityType::Ray(_) | EntityType::XLine(_) => {
+            // Infinite construction lines do not expand drawing extents.
+        }
+        EntityType::Wipeout(wo) => {
+            for pt in wo.world_boundary_vertices() {
+                let (tx, ty) = transform.apply(pt.x, pt.y);
+                bbox.update_point(tx, ty);
+            }
+        }
+        EntityType::Solid3D(solid) => {
+            for wire in &solid.wires {
+                for pt in &wire.points {
+                    let (tx, ty) = transform.apply(pt.x, pt.y);
+                    bbox.update_point(tx, ty);
+                }
+            }
+        }
+        EntityType::Ole2Frame(ole) => {
+            let (tx1, ty1) = transform.apply(ole.upper_left_corner.x, ole.upper_left_corner.y);
+            let (tx2, ty2) = transform.apply(ole.lower_right_corner.x, ole.lower_right_corner.y);
+            bbox.update_point(tx1, ty1);
+            bbox.update_point(tx2, ty2);
+        }
+        EntityType::RasterImage(img) => {
+            let (tx1, ty1) = transform.apply(img.insertion_point.x, img.insertion_point.y);
+            let p2x = img.insertion_point.x + img.u_vector.x * img.size.x + img.v_vector.x * img.size.y;
+            let p2y = img.insertion_point.y + img.u_vector.y * img.size.x + img.v_vector.y * img.size.y;
+            let (tx2, ty2) = transform.apply(p2x, p2y);
+            bbox.update_point(tx1, ty1);
+            bbox.update_point(tx2, ty2);
+        }
+        EntityType::Tolerance(tol) => {
+            let text_h = if tol.text_height > 1e-4 { tol.text_height } else { 2.5 };
+            let gap = if tol.dimension_gap > 1e-4 { tol.dimension_gap } else { text_h * 0.4 };
+            let row_h = text_h + 2.0 * gap;
+            let lines: Vec<&str> = tol.text.split(|c| c == '\n' || c == '\r').flat_map(|s| s.split("^J")).collect();
+            let n_rows = lines.len().max(1) as f64;
+            let mut max_row_w = row_h * 2.0;
+            for line in &lines {
+                let cells: Vec<&str> = line.split("%%v").collect();
+                let row_w: f64 = cells.iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        let clean = s.replace("{\\Fgdt;", "").replace("{\\FGDT;", "").replace("}", "");
+                        (clean.len() as f64 * text_h * 0.7 + 2.0 * gap).max(row_h)
+                    })
+                    .sum();
+                max_row_w = max_row_w.max(row_w);
+            }
+            let total_h = n_rows * row_h;
+            let dir_len = tol.direction.x.hypot(tol.direction.y);
+            let (ux, uy) = if dir_len > 1e-6 { (tol.direction.x / dir_len, tol.direction.y / dir_len) } else { (1.0, 0.0) };
+            let (dx, dy) = (uy, -ux);
+            let p0 = (tol.insertion_point.x, tol.insertion_point.y);
+            let p1 = (p0.0 + max_row_w * ux, p0.1 + max_row_w * uy);
+            let p2 = (p1.0 + total_h * dx, p1.1 + total_h * dy);
+            let p3 = (p0.0 + total_h * dx, p0.1 + total_h * dy);
+            for pt in [p0, p1, p2, p3] {
+                let (tx, ty) = transform.apply(pt.0, pt.1);
+                bbox.update_point(tx, ty);
             }
         }
         _ => {}
@@ -509,18 +816,20 @@ pub fn entity_intersects_bbox(
                 && max_y >= target_box.min_y
         }
         EntityType::Circle(c) => {
+            let center = c.center_wcs();
             let r = c.radius.abs();
-            (c.center.x - r) <= target_box.max_x
-                && (c.center.x + r) >= target_box.min_x
-                && (c.center.y - r) <= target_box.max_y
-                && (c.center.y + r) >= target_box.min_y
+            (center.x - r) <= target_box.max_x
+                && (center.x + r) >= target_box.min_x
+                && (center.y - r) <= target_box.max_y
+                && (center.y + r) >= target_box.min_y
         }
         EntityType::Arc(a) => {
+            let center = a.center_wcs();
             let r = a.radius.abs();
-            (a.center.x - r) <= target_box.max_x
-                && (a.center.x + r) >= target_box.min_x
-                && (a.center.y - r) <= target_box.max_y
-                && (a.center.y + r) >= target_box.min_y
+            (center.x - r) <= target_box.max_x
+                && (center.x + r) >= target_box.min_x
+                && (center.y - r) <= target_box.max_y
+                && (center.y + r) >= target_box.min_y
         }
         EntityType::Ellipse(e) => {
             let major_len = e.major_axis.x.hypot(e.major_axis.y);
@@ -612,18 +921,82 @@ pub fn entity_intersects_bbox(
                 && pt.location.y <= target_box.max_y
         }
         EntityType::Text(txt) => {
-            let margin = (txt.height * 20.0).max(100.0);
-            (txt.insertion_point.x - margin) <= target_box.max_x
-                && (txt.insertion_point.x + margin) >= target_box.min_x
-                && (txt.insertion_point.y - margin) <= target_box.max_y
-                && (txt.insertion_point.y + margin) >= target_box.min_y
+            let m = Matrix3::arbitrary_axis(txt.normal);
+            let p0 = m.transform_point(txt.insertion_point);
+            let u_cos = txt.rotation.cos();
+            let u_sin = txt.rotation.sin();
+            let w = (txt.value.len() as f64) * txt.height * 0.7 * txt.width_factor.max(0.1);
+            let h = txt.height.max(0.1);
+            let mut min_x = f64::INFINITY;
+            let mut max_x = f64::NEG_INFINITY;
+            let mut min_y = f64::INFINITY;
+            let mut max_y = f64::NEG_INFINITY;
+            for &(dx, dy) in &[(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)] {
+                let wx = p0.x + dx * u_cos - dy * u_sin;
+                let wy = p0.y + dx * u_sin + dy * u_cos;
+                min_x = min_x.min(wx);
+                max_x = max_x.max(wx);
+                min_y = min_y.min(wy);
+                max_y = max_y.max(wy);
+            }
+            min_x <= target_box.max_x && max_x >= target_box.min_x && min_y <= target_box.max_y && max_y >= target_box.min_y
         }
         EntityType::MText(mtext) => {
-            let margin = (mtext.height * 20.0).max(100.0);
-            (mtext.insertion_point.x - margin) <= target_box.max_x
-                && (mtext.insertion_point.x + margin) >= target_box.min_x
-                && (mtext.insertion_point.y - margin) <= target_box.max_y
-                && (mtext.insertion_point.y + margin) >= target_box.min_y
+            let p0 = mtext.insertion_point;
+            let sign_z = if mtext.normal.z.is_sign_negative() { -1.0 } else { 1.0 };
+            let u_cos = mtext.rotation.cos();
+            let u_sin = mtext.rotation.sin();
+            let v_x = -u_sin * sign_z;
+            let v_y = u_cos * sign_z;
+            let w = if mtext.rectangle_width > 0.0 {
+                mtext.rectangle_width
+            } else {
+                (mtext.value.len() as f64) * mtext.height * 0.7
+            };
+            let h = if let Some(eh) = mtext.rectangle_height {
+                eh.max(mtext.height)
+            } else if mtext.extents_height > 0.0 {
+                mtext.extents_height
+            } else {
+                mtext.height.max(0.1) * 3.0
+            };
+            let mut min_x = f64::INFINITY;
+            let mut max_x = f64::NEG_INFINITY;
+            let mut min_y = f64::INFINITY;
+            let mut max_y = f64::NEG_INFINITY;
+            for &(dx, dy) in &[(0.0, 0.0), (w, 0.0), (w, -h), (0.0, -h)] {
+                let wx = p0.x + dx * u_cos + dy * v_x;
+                let wy = p0.y + dx * u_sin + dy * v_y;
+                min_x = min_x.min(wx);
+                max_x = max_x.max(wx);
+                min_y = min_y.min(wy);
+                max_y = max_y.max(wy);
+            }
+            min_x <= target_box.max_x && max_x >= target_box.min_x && min_y <= target_box.max_y && max_y >= target_box.min_y
+        }
+        EntityType::AttributeDefinition(attdef) => {
+            if attdef.flags.invisible || attdef.default_value.trim().is_empty() {
+                return false;
+            }
+            let m = Matrix3::arbitrary_axis(attdef.normal);
+            let p0 = m.transform_point(attdef.insertion_point);
+            let margin = (attdef.height * (attdef.default_value.trim().len() as f64).max(1.0) * 0.8).max(10.0);
+            (p0.x - margin) <= target_box.max_x
+                && (p0.x + margin) >= target_box.min_x
+                && (p0.y - margin) <= target_box.max_y
+                && (p0.y + margin) >= target_box.min_y
+        }
+        EntityType::AttributeEntity(attrib) => {
+            if attrib.flags.invisible || attrib.value.trim().is_empty() {
+                return false;
+            }
+            let m = Matrix3::arbitrary_axis(attrib.normal);
+            let p0 = m.transform_point(attrib.insertion_point);
+            let margin = (attrib.height * (attrib.value.len() as f64).max(1.0) * 0.8).max(10.0);
+            (p0.x - margin) <= target_box.max_x
+                && (p0.x + margin) >= target_box.min_x
+                && (p0.y - margin) <= target_box.max_y
+                && (p0.y + margin) >= target_box.min_y
         }
         EntityType::Solid(solid) => {
             let min_x = solid.first_corner.x.min(solid.second_corner.x).min(solid.third_corner.x).min(solid.fourth_corner.x);
@@ -657,6 +1030,13 @@ pub fn entity_intersects_bbox(
                     && insert.insert_point.y <= target_box.max_y + 100.0;
             }
 
+            let base_pt = doc
+                .block_records
+                .get(&insert.block_name)
+                .map(|b| b.base_point)
+                .unwrap_or(acadrust::Vector3::ZERO);
+
+            let base_transform = Transform2D::from_scale_and_translation(1.0, -base_pt.x, -base_pt.y);
             let insert_transform = Transform2D::from_trs(
                 insert.insert_point.x,
                 insert.insert_point.y,
@@ -664,10 +1044,11 @@ pub fn entity_intersects_bbox(
                 insert.x_scale(),
                 insert.y_scale(),
             );
-            let (x1, y1) = insert_transform.apply(block_box.min_x, block_box.min_y);
-            let (x2, y2) = insert_transform.apply(block_box.max_x, block_box.min_y);
-            let (x3, y3) = insert_transform.apply(block_box.max_x, block_box.max_y);
-            let (x4, y4) = insert_transform.apply(block_box.min_x, block_box.max_y);
+            let combined_insert = insert_transform.combine(&base_transform);
+            let (x1, y1) = combined_insert.apply(block_box.min_x, block_box.min_y);
+            let (x2, y2) = combined_insert.apply(block_box.max_x, block_box.min_y);
+            let (x3, y3) = combined_insert.apply(block_box.max_x, block_box.max_y);
+            let (x4, y4) = combined_insert.apply(block_box.min_x, block_box.max_y);
             let min_x = x1.min(x2).min(x3).min(x4);
             let max_x = x1.max(x2).max(x3).max(x4);
             let min_y = y1.min(y2).min(y3).min(y4);
@@ -800,6 +1181,101 @@ pub fn entity_intersects_bbox(
                 && min_y <= target_box.max_y
                 && max_y >= target_box.min_y
         }
-        _ => true,
+        EntityType::MultiLeader(ml) => {
+            let mut min_x = f64::INFINITY;
+            let mut max_x = f64::NEG_INFINITY;
+            let mut min_y = f64::INFINITY;
+            let mut max_y = f64::NEG_INFINITY;
+            for root in &ml.context.leader_roots {
+                min_x = min_x.min(root.connection_point.x);
+                max_x = max_x.max(root.connection_point.x);
+                min_y = min_y.min(root.connection_point.y);
+                max_y = max_y.max(root.connection_point.y);
+                for line in &root.lines {
+                    for pt in &line.points {
+                        min_x = min_x.min(pt.x);
+                        max_x = max_x.max(pt.x);
+                        min_y = min_y.min(pt.y);
+                        max_y = max_y.max(pt.y);
+                    }
+                }
+            }
+            let tp = ml.context.text_location;
+            let tw = ml.context.text_width.max(10.0);
+            let th = ml.context.text_height.max(10.0);
+            min_x = min_x.min(tp.x - tw);
+            max_x = max_x.max(tp.x + tw);
+            min_y = min_y.min(tp.y - th);
+            max_y = max_y.max(tp.y + th);
+            if min_x.is_infinite() { return false; }
+            min_x <= target_box.max_x && max_x >= target_box.min_x && min_y <= target_box.max_y && max_y >= target_box.min_y
+        }
+        EntityType::Solid3D(solid) => {
+            let mut min_x = f64::INFINITY;
+            let mut max_x = f64::NEG_INFINITY;
+            let mut min_y = f64::INFINITY;
+            let mut max_y = f64::NEG_INFINITY;
+            for wire in &solid.wires {
+                for pt in &wire.points {
+                    min_x = min_x.min(pt.x);
+                    max_x = max_x.max(pt.x);
+                    min_y = min_y.min(pt.y);
+                    max_y = max_y.max(pt.y);
+                }
+            }
+            if min_x.is_infinite() { return false; }
+            min_x <= target_box.max_x && max_x >= target_box.min_x && min_y <= target_box.max_y && max_y >= target_box.min_y
+        }
+        EntityType::Ole2Frame(ole) => {
+            let min_x = ole.upper_left_corner.x.min(ole.lower_right_corner.x);
+            let max_x = ole.upper_left_corner.x.max(ole.lower_right_corner.x);
+            let min_y = ole.upper_left_corner.y.min(ole.lower_right_corner.y);
+            let max_y = ole.upper_left_corner.y.max(ole.lower_right_corner.y);
+            min_x <= target_box.max_x && max_x >= target_box.min_x && min_y <= target_box.max_y && max_y >= target_box.min_y
+        }
+        EntityType::RasterImage(img) => {
+            let p1x = img.insertion_point.x;
+            let p1y = img.insertion_point.y;
+            let p2x = p1x + img.u_vector.x * img.size.x + img.v_vector.x * img.size.y;
+            let p2y = p1y + img.u_vector.y * img.size.x + img.v_vector.y * img.size.y;
+            let min_x = p1x.min(p2x);
+            let max_x = p1x.max(p2x);
+            let min_y = p1y.min(p2y);
+            let max_y = p1y.max(p2y);
+            min_x <= target_box.max_x && max_x >= target_box.min_x && min_y <= target_box.max_y && max_y >= target_box.min_y
+        }
+        EntityType::Tolerance(tol) => {
+            let text_h = if tol.text_height > 1e-4 { tol.text_height } else { 2.5 };
+            let gap = if tol.dimension_gap > 1e-4 { tol.dimension_gap } else { text_h * 0.4 };
+            let row_h = text_h + 2.0 * gap;
+            let lines: Vec<&str> = tol.text.split(|c| c == '\n' || c == '\r').flat_map(|s| s.split("^J")).collect();
+            let n_rows = lines.len().max(1) as f64;
+            let mut max_row_w = row_h * 2.0;
+            for line in &lines {
+                let cells: Vec<&str> = line.split("%%v").collect();
+                let row_w: f64 = cells.iter()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| {
+                        let clean = s.replace("{\\Fgdt;", "").replace("{\\FGDT;", "").replace("}", "");
+                        (clean.len() as f64 * text_h * 0.7 + 2.0 * gap).max(row_h)
+                    })
+                    .sum();
+                max_row_w = max_row_w.max(row_w);
+            }
+            let total_h = n_rows * row_h;
+            let dir_len = tol.direction.x.hypot(tol.direction.y);
+            let (ux, uy) = if dir_len > 1e-6 { (tol.direction.x / dir_len, tol.direction.y / dir_len) } else { (1.0, 0.0) };
+            let (dx, dy) = (uy, -ux);
+            let p0 = (tol.insertion_point.x, tol.insertion_point.y);
+            let p1 = (p0.0 + max_row_w * ux, p0.1 + max_row_w * uy);
+            let p2 = (p1.0 + total_h * dx, p1.1 + total_h * dy);
+            let p3 = (p0.0 + total_h * dx, p0.1 + total_h * dy);
+            let min_x = p0.0.min(p1.0).min(p2.0).min(p3.0);
+            let max_x = p0.0.max(p1.0).max(p2.0).max(p3.0);
+            let min_y = p0.1.min(p1.1).min(p2.1).min(p3.1);
+            let max_y = p0.1.max(p1.1).max(p2.1).max(p3.1);
+            min_x <= target_box.max_x && max_x >= target_box.min_x && min_y <= target_box.max_y && max_y >= target_box.min_y
+        }
+        _ => false,
     }
 }

@@ -85,6 +85,7 @@ impl Default for ConversionMode {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Metadata {
     pub title: Option<String>,
     pub author: Option<String>,
@@ -93,6 +94,7 @@ pub struct Metadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ConversionOptions {
     pub page_size: PageSize,
     pub orientation: Orientation,
@@ -127,7 +129,7 @@ impl Default for ConversionOptions {
             export_layers: true,
             layout: None,
             metadata: Metadata {
-                creator: Some("dwgpdf (powered by hipdf & acadrust)".to_string()),
+                creator: Some("dwgpdf".to_string()),
                 ..Default::default()
             },
         }
