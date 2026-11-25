@@ -1,14 +1,44 @@
 mod common;
 
 use common::{
-    get_all_dwf_fixtures, get_all_dwg_fixtures, get_all_dxf_fixtures, save_test_output,
-    validate_pdf, OFFICIAL_DWF_FILES, OFFICIAL_DWG_FILES, OFFICIAL_DXF_FILES,
+    find_local_fixtures_with_ext, fixtures_root, get_all_dwf_fixtures, get_all_dwg_fixtures,
+    get_all_dxf_fixtures, save_test_output, validate_pdf, OFFICIAL_DWF_FILES, OFFICIAL_DWG_FILES,
+    OFFICIAL_DXF_FILES,
 };
 use dwgpdf::{
     convert_dwf_to_pdf, convert_dwg_to_pdf, convert_dxf_to_pdf, convert_file_to_pdf,
     convert_to_pdf, ColorMode, ConversionMode, ConversionOptions, Metadata, Orientation, PageSize,
 };
 use std::fs;
+use std::path::PathBuf;
+
+fn convert_and_save_fixtures(
+    paths: &[PathBuf],
+    output_prefix: &str,
+    allow_legacy_dwf_skip: bool,
+) {
+    let opts = ConversionOptions::default();
+
+    for path in paths {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+        println!("  Testing {}: {}", output_prefix, name);
+
+        let pdf = match convert_file_to_pdf(path, &opts) {
+            Ok(p) => p,
+            Err(e) if allow_legacy_dwf_skip => {
+                eprintln!("  Skipping non-package or legacy DWF {}: {:?}", name, e);
+                continue;
+            }
+            Err(e) => panic!("Failed to convert {} file {}: {:?}", output_prefix, name, e),
+        };
+
+        validate_pdf(&pdf);
+
+        let out_name = format!("{}.{}.pdf", output_prefix, stem);
+        save_test_output(&out_name, &pdf);
+    }
+}
 
 #[test]
 fn test_all_dxf_fixtures() {
@@ -22,20 +52,7 @@ fn test_all_dxf_fixtures() {
         dxf_files.len()
     );
 
-    let opts = ConversionOptions::default();
-
-    for path in &dxf_files {
-        let name = path.file_name().unwrap().to_str().unwrap();
-        println!("  Testing DXF: {}", name);
-
-        let pdf = convert_file_to_pdf(path, &opts)
-            .unwrap_or_else(|e| panic!("Failed to convert DXF file {}: {:?}", name, e));
-
-        validate_pdf(&pdf);
-
-        let out_name = format!("dxf/{}.pdf", path.file_stem().unwrap().to_str().unwrap());
-        save_test_output(&out_name, &pdf);
-    }
+    convert_and_save_fixtures(&dxf_files, "dxf", false);
 }
 
 #[test]
@@ -50,20 +67,7 @@ fn test_all_dwg_fixtures() {
         dwg_files.len()
     );
 
-    let opts = ConversionOptions::default();
-
-    for path in &dwg_files {
-        let name = path.file_name().unwrap().to_str().unwrap();
-        println!("  Testing DWG: {}", name);
-
-        let pdf = convert_file_to_pdf(path, &opts)
-            .unwrap_or_else(|e| panic!("Failed to convert DWG file {}: {:?}", name, e));
-
-        validate_pdf(&pdf);
-
-        let out_name = format!("dwg/{}.pdf", path.file_stem().unwrap().to_str().unwrap());
-        save_test_output(&out_name, &pdf);
-    }
+    convert_and_save_fixtures(&dwg_files, "dwg", false);
 }
 
 #[test]
@@ -78,24 +82,23 @@ fn test_all_dwf_fixtures() {
         dwf_files.len()
     );
 
-    let opts = ConversionOptions::default();
+    convert_and_save_fixtures(&dwf_files, "dwf", true);
+}
 
-    for path in &dwf_files {
-        let name = path.file_name().unwrap().to_str().unwrap();
-        println!("  Testing DWF: {}", name);
-
-        let pdf = match convert_file_to_pdf(path, &opts) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("  Skipping non-package or legacy DWF {}: {:?}", name, e);
-                continue;
-            }
-        };
-
-        validate_pdf(&pdf);
-
-        let out_name = format!("dwf/{}.pdf", path.file_stem().unwrap().to_str().unwrap());
-        save_test_output(&out_name, &pdf);
+#[test]
+fn test_all_local_fixtures() {
+    let root = fixtures_root();
+    for (ext, allow_legacy_skip) in [("dxf", false), ("dwg", false), ("dwf", true)] {
+        let local_files = find_local_fixtures_with_ext(&root, ext);
+        if !local_files.is_empty() {
+            println!(
+                "Found {} local {} fixture files to test",
+                local_files.len(),
+                ext
+            );
+            let prefix = format!("local.{}", ext);
+            convert_and_save_fixtures(&local_files, &prefix, allow_legacy_skip);
+        }
     }
 }
 
@@ -242,7 +245,7 @@ fn test_options_crop_mode() {
 
     let pdf = convert_dxf_to_pdf(&bytes, &opts).expect("crop mode conversion must succeed");
     validate_pdf(&pdf);
-    save_test_output("columns_R2007_cropped.pdf", &pdf);
+    save_test_output("dxf.columns_R2007_cropped.pdf", &pdf);
 }
 
 #[test]

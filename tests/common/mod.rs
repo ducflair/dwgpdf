@@ -34,7 +34,7 @@ pub fn fixtures_root() -> PathBuf {
 }
 
 pub fn tests_output_dir() -> PathBuf {
-    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/tests_output");
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/output");
     let _ = fs::create_dir_all(&out);
     out
 }
@@ -69,8 +69,7 @@ fn official_fixtures_with_ext(ext: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Finds fixtures in a caller-provided `local/` directory.
-/// The routine integration tests do not call this for the repository's user folder.
+/// Finds fixtures in a caller-provided `local/` directory, returning empty if none are present.
 pub fn find_local_fixtures_with_ext(root: &Path, ext: &str) -> Vec<PathBuf> {
     let local_dir = root.join("local");
     let mut results = fs::read_dir(local_dir)

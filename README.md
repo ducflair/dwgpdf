@@ -79,7 +79,19 @@ Run the test suite with:
 cargo test
 ```
 
-Tests use checked-in official DXF, DWG, and DWF fixtures. They do not download external data or scan or convert files in `tests/fixtures/local/`. One isolated test checks local-folder discovery and conversion using a temporary directory and a copy of a checked-in fixture.
+Tests use checked-in official DXF, DWG, and DWF fixtures, plus any optional files placed in `tests/fixtures/local/` (never required or hardcoded, so CI passes when `local/` is empty).
+
+To convert all checked-in fixtures (and any optional `tests/fixtures/local/` files) into `tests/output/`:
+
+```sh
+cargo test --release --test test_integration test_all_
+```
+
+Generated PDFs are written flat in `tests/output/` using format prefixes:
+- `tests/output/dwg.<filename>.pdf`
+- `tests/output/dwf.<filename>.pdf`
+- `tests/output/dxf.<filename>.pdf`
+- `tests/output/local.<dwg|dwf|dxf>.<filename>.pdf` (when local fixtures are present)
 
 
 ## License

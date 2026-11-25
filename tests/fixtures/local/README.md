@@ -1,5 +1,3 @@
 # Local fixtures
 
-This directory is reserved for CAD files you keep on your machine. Its contents are ignored by Git and are not read or converted by the regular test suite.
-
-The local-folder discovery test uses a temporary directory and a checked-in sample fixture, so it never depends on files in this directory.
+This directory is reserved for CAD files you keep on your machine. Its contents are ignored by Git and are optional during tests: `test_all_local_fixtures` converts any `.dxf`, `.dwg`, or `.dwf` files present here to `tests/output/local.<ext>.<filename>.pdf`, and passes cleanly when empty.
