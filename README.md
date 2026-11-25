@@ -97,3 +97,4 @@ Generated PDFs are written flat in `tests/output/` using format prefixes:
 ## License
 
 MIT
+
