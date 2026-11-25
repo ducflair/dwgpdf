@@ -171,6 +171,197 @@ impl Transform2D {
     }
 }
 
+/// Returns true if an entity inside `*Model_Space` actually has PaperSpace (`1`) or Block (`0`) ownership
+/// (e.g., orphan anonymous `*D` block entities attached as fallback by DWG readers).
+#[inline]
+pub fn is_non_model_space_entity(entity: &EntityType) -> bool {
+    matches!(entity.common().entity_mode, Some(0) | Some(1))
+}
+
+/// Computes world-space 2D corner coordinates for a non-empty MText entity.
+fn mtext_world_corners(mtext: &acadrust::entities::MText) -> Option<[(f64, f64); 4]> {
+    let clean = crate::cad::mtext::clean_mtext(&mtext.value);
+    if clean.iter().all(|l| l.trim().is_empty()) {
+        return None;
+    }
+    let p0 = mtext.insertion_point;
+    let sign_z = if mtext.normal.z.is_sign_negative() { -1.0 } else { 1.0 };
+    let u = Vector3::new(mtext.rotation.cos(), mtext.rotation.sin(), 0.0);
+    let v = Vector3::new(-mtext.rotation.sin() * sign_z, mtext.rotation.cos() * sign_z, 0.0);
+    let raw_w = clean
+        .iter()
+        .map(|l| crate::cad::mtext::estimate_str_width(l, mtext.height))
+        .fold(0.0_f64, f64::max)
+        .max(mtext.height * 0.5);
+    let (w, line_count) = if mtext.rectangle_width > 0.0 && raw_w > mtext.rectangle_width {
+        let n_lines = (raw_w / mtext.rectangle_width).ceil().max(1.0);
+        (mtext.rectangle_width, n_lines)
+    } else {
+        (raw_w, clean.len().max(1) as f64)
+    };
+    let h = (mtext.height.max(0.05) * (1.0 + (line_count - 1.0) * 1.67)).max(0.05);
+    // Adjust horizontal/vertical anchor offset based on attachment_point (Left/Center/Right, Top/Middle/Bottom)
+    let att = format!("{:?}", mtext.attachment_point);
+    let x_off = if att.contains("Center") {
+        -w * 0.5
+    } else if att.contains("Right") {
+        -w
+    } else {
+        0.0
+    };
+    let y_off = if att.contains("Middle") {
+        h * 0.5
+    } else if att.contains("Bottom") {
+        h
+    } else {
+        0.0
+    };
+    let offsets = [
+        (x_off, y_off),
+        (x_off + w, y_off),
+        (x_off + w, y_off - h),
+        (x_off, y_off - h),
+    ];
+    let mut corners = [(0.0, 0.0); 4];
+    for (idx, &(dx, dy)) in offsets.iter().enumerate() {
+        corners[idx] = (p0.x + dx * u.x + dy * v.x, p0.y + dx * u.y + dy * v.y);
+    }
+    Some(corners)
+}
+
+/// Computes exact transformed bounding box points for a circular arc.
+fn accumulate_arc_bounds(
+    arc: &acadrust::entities::Arc,
+    transform: &Transform2D,
+    bbox: &mut BoundingBox,
+) {
+    let start = arc.start_angle;
+    let mut end = arc.end_angle;
+    let pi2 = 2.0 * std::f64::consts::PI;
+    while end <= start {
+        end += pi2;
+    }
+    while end > start + pi2 {
+        end -= pi2;
+    }
+
+    if arc.normal.x.abs() > 1e-4 || arc.normal.y.abs() > 1e-4 {
+        let m = Matrix3::arbitrary_axis(arc.normal);
+        let steps = 24usize;
+        for i in 0..=steps {
+            let a = start + (end - start) * (i as f64 / steps as f64);
+            let ocs = Vector3::new(
+                arc.center.x + arc.radius * a.cos(),
+                arc.center.y + arc.radius * a.sin(),
+                arc.center.z,
+            );
+            let wcs = m.transform_point(ocs);
+            let (tx, ty) = transform.apply(wcs.x, wcs.y);
+            bbox.update_point(tx, ty);
+        }
+        return;
+    }
+
+    let center_wcs = arc.center_wcs();
+    let start_wcs = arc.start_point_wcs();
+    let end_wcs = arc.end_point_wcs();
+
+    let (cx, cy) = transform.apply(center_wcs.x, center_wcs.y);
+    let (sp_x, sp_y) = transform.apply(start_wcs.x, start_wcs.y);
+    let (ep_x, ep_y) = transform.apply(end_wcs.x, end_wcs.y);
+    bbox.update_point(sp_x, sp_y);
+    bbox.update_point(ep_x, ep_y);
+
+    let r = arc.radius.abs() * transform.scale();
+    if r < 1e-9 {
+        return;
+    }
+
+    if (end - start).abs() >= pi2 - 1e-5 {
+        bbox.update_point(cx - r, cy - r);
+        bbox.update_point(cx + r, cy + r);
+        return;
+    }
+
+    let s_rad = (sp_y - cy).atan2(sp_x - cx);
+    let mut e_rad = (ep_y - cy).atan2(ep_x - cx);
+    let ccw = (arc.normal.z >= 0.0) ^ transform.is_reflected();
+    if ccw {
+        while e_rad <= s_rad {
+            e_rad += pi2;
+        }
+        while e_rad > s_rad + pi2 {
+            e_rad -= pi2;
+        }
+    } else {
+        while e_rad >= s_rad {
+            e_rad -= pi2;
+        }
+        while e_rad < s_rad - pi2 {
+            e_rad += pi2;
+        }
+    }
+    let lo = s_rad.min(e_rad);
+    let hi = s_rad.max(e_rad);
+    for &card in &[0.0, std::f64::consts::FRAC_PI_2, std::f64::consts::PI, 3.0 * std::f64::consts::FRAC_PI_2] {
+        let mut a = card;
+        while a < lo {
+            a += pi2;
+        }
+        while a - pi2 >= lo {
+            a -= pi2;
+        }
+        if a >= lo - 1e-9 && a <= hi + 1e-9 {
+            bbox.update_point(cx + r * card.cos(), cy + r * card.sin());
+        }
+    }
+}
+
+/// Computes exact transformed bounding box points for an ellipse or elliptical arc.
+fn accumulate_ellipse_bounds(
+    ellipse: &acadrust::entities::Ellipse,
+    transform: &Transform2D,
+    bbox: &mut BoundingBox,
+) {
+    let (cx, cy) = transform.apply(ellipse.center.x, ellipse.center.y);
+    let mx = ellipse.major_axis.x * transform.a + ellipse.major_axis.y * transform.c;
+    let my = ellipse.major_axis.x * transform.b + ellipse.major_axis.y * transform.d;
+    let ratio = ellipse.minor_axis_ratio.abs().clamp(1e-6, 1.0);
+    let nx = -my * ratio;
+    let ny = mx * ratio;
+
+    let pi2 = 2.0 * std::f64::consts::PI;
+    let start = ellipse.start_parameter;
+    let mut end = ellipse.end_parameter;
+    while end <= start {
+        end += pi2;
+    }
+    while end > start + pi2 {
+        end -= pi2;
+    }
+
+    let update_param = |t: f64, b: &mut BoundingBox| {
+        b.update_point(cx + mx * t.cos() + nx * t.sin(), cy + my * t.cos() + ny * t.sin());
+    };
+    update_param(start, bbox);
+    update_param(end, bbox);
+
+    let tx = nx.atan2(mx);
+    let ty = ny.atan2(my);
+    for &cand in &[tx, tx + std::f64::consts::PI, ty, ty + std::f64::consts::PI] {
+        let mut a = cand;
+        while a < start {
+            a += pi2;
+        }
+        while a - pi2 >= start {
+            a -= pi2;
+        }
+        if a >= start - 1e-9 && a <= end + 1e-9 {
+            update_param(cand, bbox);
+        }
+    }
+}
+
 /// Compute bounding box for a CAD document with outlier detection for model space.
 pub fn calculate_document_bounds(
     doc: &CadDocument,
@@ -184,6 +375,9 @@ pub fn calculate_document_bounds(
 
     let mut entity_boxes = Vec::new();
     for entity in entities {
+        if model_space_only && is_non_model_space_entity(entity) {
+            continue;
+        }
         let dyn_ent = entity.as_entity();
         if dyn_ent.is_invisible() {
             continue;
@@ -299,7 +493,11 @@ pub fn calculate_block_bounds(doc: &CadDocument, block_name: &str) -> BoundingBo
     let mut bbox = BoundingBox::new();
     let mut visited = std::collections::HashSet::new();
     visited.insert(block_name.to_string());
+    let is_model = block_name.eq_ignore_ascii_case("*Model_Space");
     for entity in doc.entities_in_block(block_name) {
+        if is_model && is_non_model_space_entity(entity) {
+            continue;
+        }
         let dyn_ent = entity.as_entity();
         if dyn_ent.is_invisible() {
             continue;
@@ -370,18 +568,10 @@ pub fn accumulate_entity_bounds(
             bbox.update_point(cx + r, cy + r);
         }
         EntityType::Arc(arc) => {
-            let center = arc.center_wcs();
-            let (cx, cy) = transform.apply(center.x, center.y);
-            let r = arc.radius * transform.scale();
-            bbox.update_point(cx - r, cy - r);
-            bbox.update_point(cx + r, cy + r);
+            accumulate_arc_bounds(arc, transform, bbox);
         }
         EntityType::Ellipse(ellipse) => {
-            let (cx, cy) = transform.apply(ellipse.center.x, ellipse.center.y);
-            let major_len = ellipse.major_axis.x.hypot(ellipse.major_axis.y);
-            let r = major_len * transform.scale();
-            bbox.update_point(cx - r, cy - r);
-            bbox.update_point(cx + r, cy + r);
+            accumulate_ellipse_bounds(ellipse, transform, bbox);
         }
         EntityType::LwPolyline(lwpoly) => {
             for v in &lwpoly.vertices {
@@ -465,6 +655,9 @@ pub fn accumulate_entity_bounds(
             bbox.update_point(x4, y4);
         }
         EntityType::Text(txt) => {
+            if txt.value.trim().is_empty() {
+                return;
+            }
             let m = Matrix3::arbitrary_axis(txt.normal);
             let p0 = m.transform_point(txt.insertion_point);
             let u = m.transform_point(Vector3::new(txt.rotation.cos(), txt.rotation.sin(), 0.0));
@@ -544,21 +737,11 @@ pub fn accumulate_entity_bounds(
             bbox.update_point(ax, ay);
         }
         EntityType::MText(mtext) => {
-            let p0 = mtext.insertion_point;
-            let sign_z = if mtext.normal.z.is_sign_negative() { -1.0 } else { 1.0 };
-            let u = Vector3::new(mtext.rotation.cos(), mtext.rotation.sin(), 0.0);
-            let v = Vector3::new(-mtext.rotation.sin() * sign_z, mtext.rotation.cos() * sign_z, 0.0);
-            let w = if mtext.rectangle_width > 0.0 {
-                mtext.rectangle_width
-            } else {
-                (mtext.value.len() as f64) * mtext.height * 0.7
-            };
-            let h = mtext.height.max(0.1);
-            for &(dx, dy) in &[(0.0, 0.0), (w, 0.0), (w, -h), (0.0, -h)] {
-                let wx = p0.x + dx * u.x + dy * v.x;
-                let wy = p0.y + dx * u.y + dy * v.y;
-                let (tx, ty) = transform.apply(wx, wy);
-                bbox.update_point(tx, ty);
+            if let Some(corners) = mtext_world_corners(mtext) {
+                for (wx, wy) in corners {
+                    let (tx, ty) = transform.apply(wx, wy);
+                    bbox.update_point(tx, ty);
+                }
             }
         }
         EntityType::Hatch(hatch) => {
@@ -824,19 +1007,22 @@ pub fn entity_intersects_bbox(
                 && (center.y + r) >= target_box.min_y
         }
         EntityType::Arc(a) => {
-            let center = a.center_wcs();
-            let r = a.radius.abs();
-            (center.x - r) <= target_box.max_x
-                && (center.x + r) >= target_box.min_x
-                && (center.y - r) <= target_box.max_y
-                && (center.y + r) >= target_box.min_y
+            let mut b = BoundingBox::new();
+            accumulate_arc_bounds(a, &Transform2D::identity(), &mut b);
+            b.is_valid()
+                && b.min_x <= target_box.max_x
+                && b.max_x >= target_box.min_x
+                && b.min_y <= target_box.max_y
+                && b.max_y >= target_box.min_y
         }
         EntityType::Ellipse(e) => {
-            let major_len = e.major_axis.x.hypot(e.major_axis.y);
-            (e.center.x - major_len) <= target_box.max_x
-                && (e.center.x + major_len) >= target_box.min_x
-                && (e.center.y - major_len) <= target_box.max_y
-                && (e.center.y + major_len) >= target_box.min_y
+            let mut b = BoundingBox::new();
+            accumulate_ellipse_bounds(e, &Transform2D::identity(), &mut b);
+            b.is_valid()
+                && b.min_x <= target_box.max_x
+                && b.max_x >= target_box.min_x
+                && b.min_y <= target_box.max_y
+                && b.max_y >= target_box.min_y
         }
         EntityType::LwPolyline(lw) => {
             if lw.vertices.is_empty() {
@@ -921,6 +1107,9 @@ pub fn entity_intersects_bbox(
                 && pt.location.y <= target_box.max_y
         }
         EntityType::Text(txt) => {
+            if txt.value.trim().is_empty() {
+                return false;
+            }
             let m = Matrix3::arbitrary_axis(txt.normal);
             let p0 = m.transform_point(txt.insertion_point);
             let u_cos = txt.rotation.cos();
@@ -942,31 +1131,14 @@ pub fn entity_intersects_bbox(
             min_x <= target_box.max_x && max_x >= target_box.min_x && min_y <= target_box.max_y && max_y >= target_box.min_y
         }
         EntityType::MText(mtext) => {
-            let p0 = mtext.insertion_point;
-            let sign_z = if mtext.normal.z.is_sign_negative() { -1.0 } else { 1.0 };
-            let u_cos = mtext.rotation.cos();
-            let u_sin = mtext.rotation.sin();
-            let v_x = -u_sin * sign_z;
-            let v_y = u_cos * sign_z;
-            let w = if mtext.rectangle_width > 0.0 {
-                mtext.rectangle_width
-            } else {
-                (mtext.value.len() as f64) * mtext.height * 0.7
-            };
-            let h = if let Some(eh) = mtext.rectangle_height {
-                eh.max(mtext.height)
-            } else if mtext.extents_height > 0.0 {
-                mtext.extents_height
-            } else {
-                mtext.height.max(0.1) * 3.0
+            let Some(corners) = mtext_world_corners(mtext) else {
+                return false;
             };
             let mut min_x = f64::INFINITY;
             let mut max_x = f64::NEG_INFINITY;
             let mut min_y = f64::INFINITY;
             let mut max_y = f64::NEG_INFINITY;
-            for &(dx, dy) in &[(0.0, 0.0), (w, 0.0), (w, -h), (0.0, -h)] {
-                let wx = p0.x + dx * u_cos + dy * v_x;
-                let wy = p0.y + dx * u_sin + dy * v_y;
+            for (wx, wy) in corners {
                 min_x = min_x.min(wx);
                 max_x = max_x.max(wx);
                 min_y = min_y.min(wy);
@@ -1277,5 +1449,105 @@ pub fn entity_intersects_bbox(
             min_x <= target_box.max_x && max_x >= target_box.min_x && min_y <= target_box.max_y && max_y >= target_box.min_y
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acadrust::entities::{Arc, Ellipse, Line, MText};
+
+    #[test]
+    fn model_space_bounds_skips_orphan_non_model_space_entities() {
+        let mut doc = CadDocument::new();
+
+        let mut real_line = Line::from_coords(0.0, 0.0, 0.0, 10.0, 10.0, 0.0);
+        real_line.common.entity_mode = Some(2);
+        doc.add_entity(EntityType::Line(real_line)).unwrap();
+
+        // Simulate orphan block entity attached to *Model_Space with entity_mode = Some(0)
+        let mut orphan_line = Line::from_coords(5000.0, 5000.0, 0.0, 5010.0, 5010.0, 0.0);
+        orphan_line.common.entity_mode = Some(0);
+        doc.add_entity(EntityType::Line(orphan_line)).unwrap();
+
+        let ms_bbox = calculate_block_bounds(&doc, "*Model_Space");
+        assert!(ms_bbox.is_valid());
+        assert!((ms_bbox.min_x - 0.0).abs() < 1e-6);
+        assert!((ms_bbox.max_x - 10.0).abs() < 1e-6);
+        assert!((ms_bbox.min_y - 0.0).abs() < 1e-6);
+        assert!((ms_bbox.max_y - 10.0).abs() < 1e-6);
+
+        let doc_bbox = calculate_document_bounds(&doc, true);
+        assert_eq!(doc_bbox, ms_bbox);
+    }
+
+    #[test]
+    fn arc_bounds_uses_actual_sweep_not_full_circle() {
+        let mut doc = CadDocument::new();
+        let mut arc = Arc::default();
+        arc.center = Vector3::new(0.0, 0.0, 0.0);
+        arc.radius = 100.0;
+        arc.start_angle = 0.0;
+        arc.end_angle = 0.2;
+        doc.add_entity(EntityType::Arc(arc)).unwrap();
+
+        let bbox = calculate_document_bounds(&doc, true);
+        assert!(bbox.is_valid());
+        assert!(bbox.min_x > 95.0, "expected tight min_x near 98, got {}", bbox.min_x);
+        assert!(bbox.min_y >= -1e-6, "expected min_y >= 0, got {}", bbox.min_y);
+        assert!(bbox.max_y < 25.0, "expected tight max_y < 25, got {}", bbox.max_y);
+    }
+
+    #[test]
+    fn ellipse_bounds_uses_analytical_extents() {
+        let mut doc = CadDocument::new();
+        let mut ell = Ellipse::default();
+        ell.center = Vector3::new(10.0, 20.0, 0.0);
+        ell.major_axis = Vector3::new(4.0, 0.0, 0.0);
+        ell.minor_axis_ratio = 0.25;
+        ell.start_parameter = 0.0;
+        ell.end_parameter = 2.0 * std::f64::consts::PI;
+        doc.add_entity(EntityType::Ellipse(ell)).unwrap();
+
+        let bbox = calculate_document_bounds(&doc, true);
+        assert!(bbox.is_valid());
+        assert!((bbox.min_x - 6.0).abs() < 1e-4, "min_x={}", bbox.min_x);
+        assert!((bbox.max_x - 14.0).abs() < 1e-4, "max_x={}", bbox.max_x);
+        assert!((bbox.min_y - 19.0).abs() < 1e-4, "min_y={}", bbox.min_y);
+        assert!((bbox.max_y - 21.0).abs() < 1e-4, "max_y={}", bbox.max_y);
+    }
+
+    #[test]
+    fn mtext_bounds_skips_empty_and_caps_wrap_width() {
+        let mut empty_doc = CadDocument::new();
+        let mut empty_mt = MText::default();
+        empty_mt.insertion_point = Vector3::new(10000.0, 10000.0, 0.0);
+        empty_mt.value = "  \\P  ".to_string();
+        let empty_ent = EntityType::MText(empty_mt);
+        let mut cache = HashMap::new();
+        assert!(!entity_intersects_bbox(
+            &empty_doc,
+            &empty_ent,
+            &BoundingBox { min_x: 9990.0, min_y: 9990.0, max_x: 10010.0, max_y: 10010.0 },
+            &mut cache,
+        ));
+        empty_doc.add_entity(empty_ent).unwrap();
+        assert!(!calculate_block_bounds(&empty_doc, "*Model_Space").is_valid());
+        let anchor = Line::from_coords(0.0, 0.0, 0.0, 10.0, 10.0, 0.0);
+        empty_doc.add_entity(EntityType::Line(anchor)).unwrap();
+        let anchored_bbox = calculate_document_bounds(&empty_doc, true);
+        assert!((anchored_bbox.max_x - 10.0).abs() < 1e-6);
+
+        let mut doc = CadDocument::new();
+        let mut mt = MText::default();
+        mt.insertion_point = Vector3::new(0.0, 10.0, 0.0);
+        mt.height = 1.0;
+        mt.rectangle_width = 50.0;
+        mt.value = "AB".to_string();
+        doc.add_entity(EntityType::MText(mt)).unwrap();
+        let bbox = calculate_document_bounds(&doc, true);
+        assert!(bbox.is_valid());
+        // Short text "AB" should not expand all the way to rectangle_width=50
+        assert!(bbox.max_x < 5.0, "expected compact width, got max_x={}", bbox.max_x);
     }
 }

@@ -1,4 +1,7 @@
-use crate::cad::bounds::{calculate_block_bounds, calculate_document_bounds, entity_intersects_bbox, BoundingBox, Transform2D};
+use crate::cad::bounds::{
+    calculate_block_bounds, calculate_document_bounds, entity_intersects_bbox,
+    is_non_model_space_entity, BoundingBox, Transform2D,
+};
 use crate::cad::color::{aci_to_rgb, parse_hex_color, resolve_color, rgb_to_pdf};
 use crate::cad::linetype::LineDashPattern;
 use crate::cad::mtext::{
@@ -338,15 +341,31 @@ impl<'a> CadToPdfBuilder<'a> {
             return Some(b.name.clone());
         }
 
-        // 3. By standard AutoCAD paper space naming convention
-        let candidate_names = [
-            format!("*Paper_Space{}", if layout.tab_order <= 1 { String::new() } else { (layout.tab_order - 1).to_string() }),
-            format!("*Paper_Space{}", layout.tab_order),
-            "*Paper_Space".to_string(),
-        ];
+        // 3. By standard AutoCAD paper space naming convention, without stealing another layout's block
+        let mut candidate_names = Vec::new();
+        if layout.tab_order <= 1 {
+            candidate_names.push("*Paper_Space".to_string());
+            candidate_names.push("*Paper_Space0".to_string());
+        } else {
+            candidate_names.push(format!("*Paper_Space{}", layout.tab_order - 1));
+            candidate_names.push(format!("*Paper_Space{}", layout.tab_order));
+        }
+
         for name in &candidate_names {
-            if self.doc.block_records.iter().any(|b| b.name.eq_ignore_ascii_case(name)) {
-                return Some(name.clone());
+            if let Some(b) = self.doc.block_records.iter().find(|b| b.name.eq_ignore_ascii_case(name)) {
+                let owned_by_other_layout = (b.layout.value() != 0 && b.layout != layout.handle)
+                    || self.doc.objects.values().any(|obj| {
+                        matches!(
+                            obj,
+                            ObjectType::Layout(other)
+                                if other.handle != layout.handle
+                                    && other.block_record.value() != 0
+                                    && other.block_record == b.handle
+                        )
+                    });
+                if !owned_by_other_layout {
+                    return Some(b.name.clone());
+                }
             }
         }
 
@@ -379,13 +398,18 @@ impl<'a> CadToPdfBuilder<'a> {
             }
         });
 
+        let is_model = block_name.eq_ignore_ascii_case("*Model_Space");
         let mut entities: Vec<&'a EntityType> = if let Some(br) = block_rec {
             br.entity_handles
                 .iter()
                 .filter_map(|h| self.doc.get_entity(*h))
+                .filter(|e| !(is_model && is_non_model_space_entity(e)))
                 .collect()
         } else {
-            self.doc.entities_in_block(block_name).collect()
+            self.doc
+                .entities_in_block(block_name)
+                .filter(|e| !(is_model && is_non_model_space_entity(e)))
+                .collect()
         };
 
         if let Some(st) = sort_table {
@@ -396,6 +420,35 @@ impl<'a> CadToPdfBuilder<'a> {
         }
 
         entities
+    }
+
+    /// Returns true if an entity is visible and plottable on its layer (excluding empty/invisible entities).
+    fn is_entity_renderable(&self, entity: &EntityType, frozen_handles: Option<&HashSet<Handle>>) -> bool {
+        let dyn_ent = entity.as_entity();
+        if dyn_ent.is_invisible() {
+            return false;
+        }
+        let layer_name = dyn_ent.layer();
+        if layer_name.eq_ignore_ascii_case("defpoints") {
+            return false;
+        }
+        if let Some(layer) = self.doc.layers.iter().find(|l| l.name.eq_ignore_ascii_case(layer_name)) {
+            if !layer.is_plottable
+                || layer.is_frozen()
+                || layer.is_off()
+                || frozen_handles.map_or(false, |fh| fh.contains(&layer.handle))
+            {
+                return false;
+            }
+        }
+        match entity {
+            EntityType::Text(t) => !t.value.trim().is_empty(),
+            EntityType::MText(m) => !self.resolve_mtext_value(m).trim().is_empty(),
+            EntityType::Insert(ins) => {
+                !ins.attributes.is_empty() || self.doc.entities_in_block(&ins.block_name).next().is_some()
+            }
+            _ => true,
+        }
     }
 
     /// Checks whether a layout is enabled and visible (contains sheet geometry or active model viewports).
@@ -411,7 +464,7 @@ impl<'a> CadToPdfBuilder<'a> {
         };
 
         let mut has_sheet_entities = false;
-        let mut has_active_viewport = false;
+        let mut active_vp_boxes: Vec<(BoundingBox, HashSet<Handle>)> = Vec::new();
 
         for entity in self.doc.entities_in_block(&block_name) {
             match entity {
@@ -422,51 +475,50 @@ impl<'a> CadToPdfBuilder<'a> {
                             && (vp.height - vp.view_height).abs() < 1e-3
                     );
                     if !is_overall && vp.status.is_on && vp.width > 0.0 && vp.height > 0.0 && vp.view_height > 0.0 {
-                        has_active_viewport = true;
+                        let aspect = vp.width / vp.height;
+                        let view_w = vp.view_height * aspect;
+                        let twist_rad = -vp.twist_angle;
+                        let cos_tw = twist_rad.cos();
+                        let sin_tw = twist_rad.sin();
+                        let model_cx = vp.view_target.x + vp.view_center.x * cos_tw - vp.view_center.y * sin_tw;
+                        let model_cy = vp.view_target.y + vp.view_center.x * sin_tw + vp.view_center.y * cos_tw;
+                        let extent_x = (view_w * cos_tw.abs() + vp.view_height * sin_tw.abs()) / 2.0;
+                        let extent_y = (view_w * sin_tw.abs() + vp.view_height * cos_tw.abs()) / 2.0;
+                        let vp_box = BoundingBox {
+                            min_x: model_cx - extent_x,
+                            max_x: model_cx + extent_x,
+                            min_y: model_cy - extent_y,
+                            max_y: model_cy + extent_y,
+                        };
+                        let frozen: HashSet<Handle> = vp.frozen_layers.iter().copied().collect();
+                        active_vp_boxes.push((vp_box, frozen));
                     }
                 }
                 _ => {
-                    has_sheet_entities = true;
+                    if self.is_entity_renderable(entity, None) {
+                        has_sheet_entities = true;
+                    }
                 }
             }
         }
 
-        // A layout is enabled and visible if it contains sheet entities (title block, annotations, geometry)
-        // or active viewports looking into model space.
+        // A layout is enabled and visible if it contains visible sheet entities (title block, annotations, geometry)
+        // or active viewports looking into visible model space geometry.
         if !has_sheet_entities {
-            if !has_active_viewport {
-                return false;
-            }
-            // Collect bounding boxes of all active viewports in model space
-            let mut vp_boxes = Vec::new();
-            for entity in self.doc.entities_in_block(&block_name) {
-                if let EntityType::Viewport(vp) = entity {
-                    let is_overall = vp.id == 1 || (
-                        (vp.center.x - vp.view_center.x).abs() < 1e-3
-                            && (vp.center.y - vp.view_center.y).abs() < 1e-3
-                            && (vp.height - vp.view_height).abs() < 1e-3
-                    );
-                    if !is_overall && vp.status.is_on && vp.width > 0.0 && vp.height > 0.0 && vp.view_height > 0.0 {
-                        let aspect = vp.width / vp.height;
-                        let view_w = vp.view_height * aspect;
-                        vp_boxes.push(BoundingBox {
-                            min_x: vp.view_center.x - view_w / 2.0,
-                            max_x: vp.view_center.x + view_w / 2.0,
-                            min_y: vp.view_center.y - vp.view_height / 2.0,
-                            max_y: vp.view_center.y + vp.view_height / 2.0,
-                        });
-                    }
-                }
-            }
-
-            if vp_boxes.is_empty() {
+            if active_vp_boxes.is_empty() {
                 return false;
             }
 
             let mut cache = HashMap::new();
             let mut model_hits = 0;
             for entity in self.doc.entities_in_block("*Model_Space") {
-                for vp_box in &vp_boxes {
+                if is_non_model_space_entity(entity) {
+                    continue;
+                }
+                for (vp_box, frozen) in &active_vp_boxes {
+                    if !self.is_entity_renderable(entity, Some(frozen)) {
+                        continue;
+                    }
                     if crate::cad::bounds::entity_intersects_bbox(self.doc, entity, vp_box, &mut cache) {
                         model_hits += 1;
                         if model_hits >= 20 {
@@ -504,8 +556,9 @@ impl<'a> CadToPdfBuilder<'a> {
                 });
 
                 if let Some(l) = layout_obj {
-                    let page_id = self.build_paper_space_page(&l)?;
-                    page_ids.push(page_id);
+                    if let Some(page_id) = self.build_paper_space_page(&l)? {
+                        page_ids.push(page_id);
+                    }
                 } else {
                     // Fall back to model space if not found
                     let page_id = self.build_model_space_page()?;
@@ -531,8 +584,9 @@ impl<'a> CadToPdfBuilder<'a> {
             });
 
             for l in &paper_layouts {
-                let page_id = self.build_paper_space_page(l)?;
-                page_ids.push(page_id);
+                if let Some(page_id) = self.build_paper_space_page(l)? {
+                    page_ids.push(page_id);
+                }
             }
 
             // 2. Model Space is ALWAYS the last page!
@@ -601,13 +655,16 @@ impl<'a> CadToPdfBuilder<'a> {
         Ok(output)
     }
 
-    /// Builds a single paper space layout page.
+    /// Builds a single paper space layout page. Returns `None` if no visible content is rendered.
     fn build_paper_space_page(
         &mut self,
         layout: &acadrust::objects::Layout,
-    ) -> ConversionResult<(u32, u16)> {
+    ) -> ConversionResult<Option<(u32, u16)>> {
         // Find block name associated with this layout
-        let block_name = self.find_layout_block_name(layout).unwrap_or_else(|| "*Paper_Space".to_string());
+        let block_name = match self.find_layout_block_name(layout) {
+            Some(name) => name,
+            None => return Ok(None),
+        };
 
         // Determine paper size and coordinate transform
         let extent_w = (layout.max_limits.0 - layout.min_limits.0).abs();
@@ -704,6 +761,8 @@ impl<'a> CadToPdfBuilder<'a> {
         }
 
         let model_entities = self.get_sorted_entities_in_block("*Model_Space");
+
+        let mut has_rendered_content = false;
 
         // 2. Render each Viewport looking into Model Space
         for vp in viewports {
@@ -830,6 +889,7 @@ impl<'a> CadToPdfBuilder<'a> {
             }
 
             if !vp_content.is_empty() {
+                has_rendered_content = true;
                 page_stream.push_str(&vp_stream);
                 page_stream.push_str(&vp_content);
                 page_stream.push_str("Q\n");
@@ -888,6 +948,13 @@ impl<'a> CadToPdfBuilder<'a> {
             sheet_content.push_str("EMC\n");
         }
 
+        if !sheet_content.is_empty() {
+            has_rendered_content = true;
+        }
+        if !has_rendered_content {
+            return Ok(None);
+        }
+
         page_stream.push_str(&sheet_content);
         page_stream.push_str("Q\n");
 
@@ -925,7 +992,7 @@ impl<'a> CadToPdfBuilder<'a> {
         page.set("Resources", Object::Dictionary(resources));
 
         let page_id = self.pdf_doc.add_object(Object::Dictionary(page));
-        Ok(page_id)
+        Ok(Some(page_id))
     }
 
     /// Builds the Model Space page (always the last page).
@@ -1219,7 +1286,7 @@ fn map_attrib_v_align(v: acadrust::entities::attribute_definition::VerticalAlign
             }
         }
 
-        let pw = line_width_pt.clamp(0.35, 0.75);
+        let pw = if line_width_pt > 0.0 { line_width_pt.clamp(0.1, 0.75) } else { 0.0 };
 
         for (ang, bpx, bpy, off_x, off_y, dashes) in families {
             let u = (ang.cos(), ang.sin());
@@ -1263,7 +1330,16 @@ fn map_attrib_v_align(v: acadrust::entities::attribute_definition::VerticalAlign
             }
 
             let dash_pattern = if !dashes.is_empty() {
-                let arr: Vec<f32> = dashes.iter().map(|&d| (d.abs() * transform.scale()).max(0.5) as f32).collect();
+                let arr: Vec<f32> = dashes
+                    .iter()
+                    .map(|&d| {
+                        if d.abs() < 1e-6 {
+                            0.1
+                        } else {
+                            (d.abs() * transform.scale()).max(0.05) as f32
+                        }
+                    })
+                    .collect();
                 Some(arr)
             } else {
                 None
@@ -4025,4 +4101,42 @@ fn encode_pdf_string(s: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use acadrust::entities::Line;
+    use acadrust::types::Handle;
+
+    #[test]
+    fn empty_and_non_renderable_paper_space_layouts_produce_only_model_space() {
+        let mut doc = CadDocument::new();
+
+        // Add visible geometry in *Model_Space
+        let line = Line::from_coords(0.0, 0.0, 0.0, 100.0, 50.0, 0.0);
+        doc.add_entity(EntityType::Line(line)).unwrap();
+
+        // Add non-renderable entities (invisible and Defpoints) into *Paper_Space
+        let mut inv_line = Line::from_coords(0.0, 0.0, 0.0, 10.0, 10.0, 0.0);
+        inv_line.common.invisible = true;
+        inv_line.common.entity_mode = Some(1);
+        doc.add_entity(EntityType::Line(inv_line)).unwrap();
+
+        let mut defpoints_line = Line::from_coords(0.0, 0.0, 0.0, 10.0, 10.0, 0.0);
+        defpoints_line.common.layer = "Defpoints".to_string();
+        defpoints_line.common.entity_mode = Some(1);
+        doc.add_entity(EntityType::Line(defpoints_line)).unwrap();
+
+        // Add an unlinked empty extra Layout
+        let mut extra_layout = acadrust::objects::Layout::new("EmptyLayout");
+        extra_layout.handle = Handle::new(0x9999);
+        extra_layout.tab_order = 2;
+        doc.objects.insert(extra_layout.handle, ObjectType::Layout(extra_layout));
+
+        let pdf_bytes = crate::pdf::convert_cad_to_pdf(&doc, ConversionOptions::default())
+            .expect("synthetic document conversion should succeed");
+        let pdf_doc = hipdf::lopdf::Document::load_mem(&pdf_bytes).expect("valid PDF");
+        assert_eq!(pdf_doc.get_pages().len(), 1, "expected only Model space page");
+    }
 }
