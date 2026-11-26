@@ -1024,7 +1024,10 @@ fn find_file_in_archive<R: Read + std::io::Seek>(
     let target_filename = norm1.rsplit('/').next().unwrap_or(&norm1).to_lowercase();
     for i in 0..archive.len() {
         if let Ok(f) = archive.by_index(i) {
-            let name = f.name().to_string();
+            let Ok(name) = f.name() else {
+                continue;
+            };
+            let name = name.into_owned();
             let name_norm = name.replace('\\', "/");
             if name_norm.eq_ignore_ascii_case(&norm1) || name.eq_ignore_ascii_case(&norm2) {
                 return Some(i);
@@ -1227,7 +1230,10 @@ pub fn convert_dwf_to_pdf(dwf_bytes: &[u8], options: &ConversionOptions) -> Conv
         if sheets.is_empty() {
             for i in 0..archive.len() {
                 if let Ok(mut f) = archive.by_index(i) {
-                    let name = f.name().to_string();
+                    let Ok(name) = f.name() else {
+                        continue;
+                    };
+                    let name = name.into_owned();
                     if name.ends_with(".w2d") {
                         let mut w2d_bytes = Vec::new();
                         if f.read_to_end(&mut w2d_bytes).is_ok() {
@@ -1253,7 +1259,10 @@ pub fn convert_dwf_to_pdf(dwf_bytes: &[u8], options: &ConversionOptions) -> Conv
         if sheets.is_empty() {
             for i in 0..archive.len() {
                 if let Ok(mut f) = archive.by_index(i) {
-                    let name = f.name().to_string();
+                    let Ok(name) = f.name() else {
+                        continue;
+                    };
+                    let name = name.into_owned();
                     let lower = name.to_lowercase();
                     if lower.ends_with(".jpg") || lower.ends_with(".png") || lower.ends_with(".jpeg") {
                         let mut bytes = Vec::new();
